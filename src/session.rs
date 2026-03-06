@@ -58,6 +58,7 @@ impl SessionManager {
         &self,
         call_id: pjsua_call_id,
         mumble_server: Option<String>,
+        caller_number: Option<String>,
     ) -> anyhow::Result<()> {
         // Check max concurrent calls
         {
@@ -76,7 +77,10 @@ impl SessionManager {
             }
         }
 
-        let mumble_config = self.config.mumble_config(mumble_server.as_deref());
+        let mut mumble_config = self.config.mumble_config(mumble_server.as_deref());
+        if let Some(ref number) = caller_number {
+            mumble_config.username = number.clone();
+        }
         let sample_rate = self.config.audio.sample_rate;
         let samples_per_frame = sample_rate * self.config.audio.frame_duration_ms / 1000;
 

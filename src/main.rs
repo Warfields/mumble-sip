@@ -39,11 +39,12 @@ async fn main() -> anyhow::Result<()> {
             SipEvent::IncomingCall {
                 call_id,
                 mumble_server,
+                caller_number,
                 ..
             } => {
                 let mgr = session_mgr.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = mgr.on_incoming_call(call_id, mumble_server).await {
+                    if let Err(e) = mgr.on_incoming_call(call_id, mumble_server, caller_number).await {
                         error!("Failed to handle incoming call {}: {}", call_id, e);
                     }
                 });

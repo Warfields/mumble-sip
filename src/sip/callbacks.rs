@@ -13,6 +13,8 @@ pub enum SipEvent {
         call_id: pjsua_call_id,
         /// Mumble server from X-Mumble-Server header, if present.
         mumble_server: Option<String>,
+        /// Caller phone number extracted from the SIP From URI.
+        caller_number: Option<String>,
     },
     CallStateChanged {
         call_id: pjsua_call_id,
@@ -125,6 +127,32 @@ unsafe fn extract_header_value(rdata: *mut pjsip_rx_data, header_name: &str) -> 
     Some(String::from_utf8_lossy(slice).trim().to_string())
 }
 
+/// Extract the caller's phone number from a SIP URI string.
+///
+/// Handles formats like:
+/// - `<sip:+17204919941@192.168.50.100>` → `7204919941`
+/// - `"Display" <sip:1234@host>` → `1234`
+/// - `sip:user@host` → `user`
+fn extract_phone_number(remote_info: &str) -> Option<String> {
+    // Find the user part of the SIP URI: between "sip:" and "@"
+    let sip_start = remote_info.find("sip:")? + 4;
+    let at_pos = remote_info[sip_start..].find('@')?;
+    let user_part = &remote_info[sip_start..sip_start + at_pos];
+
+    // Strip leading '+' and any country code prefix, keeping just digits
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    // Strip leading '1' country code if the number is 11 digits (US/CA)
+    if digits.len() == 11 && digits.starts_with('1') {
+        Some(digits[1..].to_string())
+    } else {
+        Some(digits)
+    }
+}
+
 /// C callback: incoming SIP call.
 unsafe extern "C" fn on_incoming_call(
     acc_id: pjsua_acc_id,
@@ -139,10 +167,30 @@ unsafe extern "C" fn on_incoming_call(
         info!("X-Mumble-Server: {}", server);
     }
 
+    // Extract caller number from call info
+    let caller_number = unsafe {
+        let mut ci: pjsua_call_info = std::mem::zeroed();
+        if pjsua_call_get_info(call_id, &mut ci) == 0 {
+            let remote = std::slice::from_raw_parts(
+                ci.remote_info.ptr as *const u8,
+                ci.remote_info.slen as usize,
+            );
+            let remote_str = String::from_utf8_lossy(remote);
+            let number = extract_phone_number(&remote_str);
+            if let Some(ref num) = number {
+                info!("Caller number: {}", num);
+            }
+            number
+        } else {
+            None
+        }
+    };
+
     send_event(SipEvent::IncomingCall {
         acc_id,
         call_id,
         mumble_server,
+        caller_number,
     });
 }
 
