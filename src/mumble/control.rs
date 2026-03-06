@@ -44,6 +44,8 @@ pub struct MumbleClient {
     outgoing_tx: mpsc::UnboundedSender<ControlPacket<Serverbound>>,
     event_rx: mpsc::UnboundedReceiver<MumbleEvent>,
     session_id: u32,
+    recv_task: tokio::task::JoinHandle<()>,
+    send_task: tokio::task::JoinHandle<()>,
 }
 
 impl MumbleClient {
@@ -144,7 +146,7 @@ impl MumbleClient {
 
         // Spawn receive loop
         let event_tx_recv = event_tx.clone();
-        tokio::spawn(async move {
+        let recv_task = tokio::spawn(async move {
             while let Some(packet) = stream.next().await {
                 match packet {
                     Ok(packet) => Self::handle_packet(packet, &event_tx_recv),
@@ -159,7 +161,7 @@ impl MumbleClient {
         });
 
         // Spawn send loop: drains outgoing channel + periodic pings
-        tokio::spawn(async move {
+        let send_task = tokio::spawn(async move {
             let mut ping_interval = time::interval(Duration::from_secs(15));
 
             loop {
@@ -190,6 +192,8 @@ impl MumbleClient {
             outgoing_tx,
             event_rx,
             session_id,
+            recv_task,
+            send_task,
         })
     }
 
@@ -272,6 +276,13 @@ impl MumbleClient {
         MumbleSender {
             outgoing_tx: self.outgoing_tx.clone(),
         }
+    }
+}
+
+impl Drop for MumbleClient {
+    fn drop(&mut self) {
+        self.recv_task.abort();
+        self.send_task.abort();
     }
 }
 
