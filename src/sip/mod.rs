@@ -122,6 +122,11 @@ impl PjsuaEndpoint {
             check_status(pjsua_start(), "pjsua_start")?;
             debug!("pjsua started");
 
+            // Use null sound device — no real audio hardware needed.
+            // This provides the conference bridge clock on headless servers.
+            check_status(pjsua_set_null_snd_dev(), "pjsua_set_null_snd_dev")?;
+            debug!("Null sound device set");
+
             // Register SIP account
             let acc_uri_cstr = CString::new(config.account_uri.as_str())?;
             let registrar_cstr = CString::new(config.registrar.as_str())?;

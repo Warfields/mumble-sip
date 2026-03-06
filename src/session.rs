@@ -124,8 +124,9 @@ impl SessionManager {
 
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
         let (opus_encoded_tx, mut opus_encoded_rx) = mpsc::unbounded_channel::<(u64, Bytes)>();
+        let opus_bitrate = self.config.audio.opus_bitrate;
         let encoder_handle =
-            AudioBridge::spawn_encoder(buffers.sip_to_mumble_cons, opus_encoded_tx, sample_rate);
+            AudioBridge::spawn_encoder(buffers.sip_to_mumble_cons, opus_encoded_tx, sample_rate, opus_bitrate);
 
         // Spawn voice forwarder: sends encoded Opus to Mumble
         let voice_forward_handle = tokio::spawn(async move {

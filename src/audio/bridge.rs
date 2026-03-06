@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use opus::{Application, Channels, Decoder, Encoder};
-use ringbuf::traits::{Consumer, Producer};
+use ringbuf::traits::{Consumer, Observer, Producer};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
@@ -27,10 +27,16 @@ impl AudioBridge {
         mut pcm_consumer: ringbuf::HeapCons<i16>,
         opus_tx: mpsc::UnboundedSender<(u64, Bytes)>,
         sample_rate: u32,
+        opus_bitrate: u32,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut encoder = match Encoder::new(sample_rate, Channels::Mono, Application::Voip) {
-                Ok(enc) => enc,
+                Ok(mut enc) => {
+                    if let Err(e) = enc.set_bitrate(opus::Bitrate::Bits(opus_bitrate as i32)) {
+                        warn!("Failed to set Opus bitrate to {}: {}", opus_bitrate, e);
+                    }
+                    enc
+                }
                 Err(e) => {
                     error!("Failed to create Opus encoder: {}", e);
                     return;
@@ -41,21 +47,23 @@ impl AudioBridge {
             let mut pcm_buf = vec![0i16; SAMPLES_PER_FRAME];
             let mut opus_buf = vec![0u8; MAX_OPUS_FRAME_SIZE];
 
-            // Interval matching the frame duration
+            // Poll frequently but only encode when a full frame is available.
+            // This avoids timer drift vs pjsip's put_frame cadence.
             let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_millis(FRAME_DURATION_MS as u64));
+                tokio::time::interval(tokio::time::Duration::from_millis(5));
 
             loop {
                 interval.tick().await;
 
-                // Try to read a full frame of PCM samples
-                let read = pcm_consumer.pop_slice(&mut pcm_buf);
-                if read == 0 {
-                    // No audio data available — send silence or skip
+                // Wait until we have a full frame of samples
+                if pcm_consumer.occupied_len() < SAMPLES_PER_FRAME {
                     continue;
                 }
 
-                // Zero-fill if we got a partial frame
+                let read = pcm_consumer.pop_slice(&mut pcm_buf);
+                debug_assert!(read >= SAMPLES_PER_FRAME);
+
+                // Zero-fill if somehow short
                 if read < SAMPLES_PER_FRAME {
                     pcm_buf[read..].fill(0);
                 }
