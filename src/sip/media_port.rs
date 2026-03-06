@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pjsip_sys::*;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
-use tracing::warn;
+use tracing::debug;
 
 static SIP_TO_MUMBLE_DROPPED_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static MUMBLE_TO_SIP_UNDERFLOW_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -19,7 +19,7 @@ fn track_samples(counter: &AtomicU64, delta: u64, label: &str) {
     let prev = counter.fetch_add(delta, Ordering::Relaxed);
     let total = prev + delta;
     if total / TELEMETRY_LOG_STEP_SAMPLES != prev / TELEMETRY_LOG_STEP_SAMPLES {
-        warn!("Audio telemetry: {} (total_samples={})", label, total);
+        debug!("Audio telemetry: {} (total_samples={})", label, total);
     }
 }
 
