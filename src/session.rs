@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::bridge::AudioBridge;
+use crate::audio::sounds::{self, SoundEvent};
 use crate::config::Config;
 use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
@@ -33,6 +34,12 @@ struct CallSession {
     mumble_event_handle: JoinHandle<()>,
     /// Sender handle for sending control messages to Mumble.
     mumble_sender: MumbleSender,
+    /// Send sound effect PCM to the decoder for playback to the SIP caller.
+    sound_tx: mpsc::UnboundedSender<Vec<i16>>,
+    /// Notify the event handler of channel changes from DTMF navigation.
+    channel_watch_tx: tokio::sync::watch::Sender<u32>,
+    /// This call's Mumble session ID, for deregistering from bridge_mumble_sessions on teardown.
+    mumble_session_id: u32,
     /// Current Mumble channel ID.
     current_channel_id: u32,
     /// Highest channel ID on this server (from connect-time handshake).
@@ -71,6 +78,9 @@ impl DeferredCleanup {
 /// Manages all active call sessions.
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
+    /// Mumble session IDs belonging to this bridge. Used to suppress audio
+    /// feedback between co-located bridge callers on the same server.
+    bridge_mumble_sessions: Arc<Mutex<HashSet<u32>>>,
     config: Config,
 }
 
@@ -78,6 +88,7 @@ impl SessionManager {
     pub fn new(config: Config) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            bridge_mumble_sessions: Arc::new(Mutex::new(HashSet::new())),
             config,
         }
     }
@@ -123,7 +134,9 @@ impl SessionManager {
         let jitter_frames = (self.config.audio.jitter_buffer_ms
             / crate::audio::bridge::FRAME_DURATION_MS)
             .max(2) as usize;
-        let queue_capacity = (jitter_frames * 2).max(8);
+        // Scale the opus→decoder channel by max_concurrent_calls to accommodate
+        // bursts from multiple simultaneous Mumble speakers on a busy server.
+        let queue_capacity = jitter_frames * self.config.sip.max_concurrent_calls as usize;
 
         info!(
             "Setting up session for call {} -> Mumble {}:{}",
@@ -190,25 +203,50 @@ impl SessionManager {
         let (opus_to_decoder_tx, opus_to_decoder_rx) =
             mpsc::channel::<(u32, Bytes)>(queue_capacity);
 
+        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
+        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+
         // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
         let decoder_handle = AudioBridge::spawn_mixed_decoder(
             opus_to_decoder_rx,
+            sound_rx,
             buffers.mumble_to_sip_prod,
             sample_rate,
             jitter_frames,
         );
 
-        // Spawn Mumble event handler: receives audio events and feeds them to the decoder
+        // Spawn Mumble event handler: receives audio/state events and feeds them to the decoder
         let opus_tx = opus_to_decoder_tx.clone();
+        let event_sound_tx = sound_tx.clone();
+        let our_session_id = mumble.session_id();
+        let bridge_sessions = Arc::clone(&self.bridge_mumble_sessions);
+        bridge_sessions.lock().unwrap().insert(our_session_id);
+        let (channel_watch_tx, mut channel_watch_rx) =
+            tokio::sync::watch::channel(initial_channel_id);
         let mumble_event_handle = tokio::spawn(async move {
             let mut dropped_decoder_frames: u64 = 0;
+            // Track which channel each user is in so we can detect join/leave.
+            let mut user_channels: HashMap<u32, u32> = HashMap::new();
+            let mut our_channel_id = initial_channel_id;
+
             while let Some(event) = mumble.recv_event().await {
+                // Check for channel updates from DTMF navigation
+                if channel_watch_rx.has_changed().unwrap_or(false) {
+                    our_channel_id = *channel_watch_rx.borrow_and_update();
+                }
+
                 match event {
                     MumbleEvent::AudioReceived {
                         session_id,
                         opus_data,
                         ..
-                    } => match opus_tx.try_send((session_id, opus_data)) {
+                    } => {
+                        // Drop audio from our own session and from other bridge
+                        // callers on the same server to prevent feedback loops.
+                        if bridge_sessions.lock().unwrap().contains(&session_id) {
+                            continue;
+                        }
+                        match opus_tx.try_send((session_id, opus_data)) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             dropped_decoder_frames += 1;
@@ -220,7 +258,40 @@ impl SessionManager {
                             }
                         }
                         Err(TrySendError::Closed(_)) => break,
-                    },
+                        }
+                    }
+                    MumbleEvent::UserChangedChannel {
+                        session_id,
+                        channel_id,
+                    } => {
+                        let old_channel = user_channels.insert(session_id, channel_id);
+
+                        if session_id == our_session_id {
+                            // We changed channel (server confirmed)
+                            our_channel_id = channel_id;
+                            let _ =
+                                event_sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+                        } else if channel_id == our_channel_id {
+                            // Someone joined our channel
+                            let _ = event_sound_tx
+                                .send(sounds::get_sound(SoundEvent::UserJoinedChannel));
+                        } else if old_channel == Some(our_channel_id) {
+                            // Someone left our channel
+                            let _ =
+                                event_sound_tx.send(sounds::get_sound(SoundEvent::UserLeftChannel));
+                        }
+                    }
+                    MumbleEvent::UserDisconnected { session_id } => {
+                        if let Some(ch) = user_channels.remove(&session_id)
+                            && ch == our_channel_id
+                        {
+                            let _ = event_sound_tx
+                                .send(sounds::get_sound(SoundEvent::UserLeftChannel));
+                        }
+                    }
+                    MumbleEvent::TextMessageReceived { .. } => {
+                        let _ = event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                    }
                     MumbleEvent::Disconnected => {
                         info!("Mumble disconnected for call event loop");
                         break;
@@ -243,6 +314,9 @@ impl SessionManager {
             }
         }
 
+        // Play the self-joined-channel sound on initial connect
+        let _ = sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+
         // Store the session
         let session = CallSession {
             media_port: SendablePort(media_port),
@@ -251,6 +325,9 @@ impl SessionManager {
             voice_forward_handle,
             mumble_event_handle,
             mumble_sender,
+            sound_tx,
+            channel_watch_tx,
+            mumble_session_id: our_session_id,
             current_channel_id: initial_channel_id,
             max_channel_id,
         };
@@ -283,6 +360,10 @@ impl SessionManager {
             warn!("Failed to join channel {}: {}", new_channel_id, e);
         } else {
             session.current_channel_id = new_channel_id;
+            // Notify the event handler of the new channel so it can correctly
+            // attribute join/leave events. The sound plays when the server
+            // confirms the move via UserChangedChannel for our own session_id.
+            let _ = session.channel_watch_tx.send(new_channel_id);
         }
     }
 
@@ -295,6 +376,12 @@ impl SessionManager {
         };
 
         info!("Tearing down session for call {}", call_id);
+
+        // Deregister this call's Mumble session ID so other callers stop filtering it.
+        self.bridge_mumble_sessions
+            .lock()
+            .unwrap()
+            .remove(&session.mumble_session_id);
 
         // Resolve media ownership state before cleanup:
         // - pending: port was never attached to conference

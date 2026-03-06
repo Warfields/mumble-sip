@@ -28,6 +28,16 @@ pub enum MumbleEvent {
         opus_data: Bytes,
         seq_num: u64,
     },
+    UserChangedChannel {
+        session_id: u32,
+        channel_id: u32,
+    },
+    UserDisconnected {
+        session_id: u32,
+    },
+    TextMessageReceived {
+        message: String,
+    },
 }
 
 /// Configuration for connecting to a Mumble server.
@@ -229,6 +239,24 @@ impl MumbleClient {
             }
             ControlPacket::UserState(msg) => {
                 debug!("User state: session={} name={}", msg.session(), msg.name());
+                if msg.has_channel_id() {
+                    let _ = event_tx.send(MumbleEvent::UserChangedChannel {
+                        session_id: msg.session(),
+                        channel_id: msg.channel_id(),
+                    });
+                }
+            }
+            ControlPacket::UserRemove(msg) => {
+                debug!("User removed: session={}", msg.session());
+                let _ = event_tx.send(MumbleEvent::UserDisconnected {
+                    session_id: msg.session(),
+                });
+            }
+            ControlPacket::TextMessage(msg) => {
+                debug!("Text message: {}", msg.message());
+                let _ = event_tx.send(MumbleEvent::TextMessageReceived {
+                    message: msg.message().to_string(),
+                });
             }
             ControlPacket::Ping(_) => {}
             _ => {}

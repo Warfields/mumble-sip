@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Opus frame duration in milliseconds.
 /// Mumble uses 10ms frames (iFrameSize = SAMPLE_RATE / 100 = 480).
@@ -117,9 +117,11 @@ impl AudioBridge {
     /// Spawn a mixed decoder task:
     /// - decodes each speaker using its own Opus decoder state
     /// - mixes active speakers into one 10ms PCM frame
+    /// - mixes in queued sound effects (join/leave chimes, etc.)
     /// - outputs exactly one mixed frame per tick to match realtime playout
     pub fn spawn_mixed_decoder(
         mut opus_rx: mpsc::Receiver<(u32, Bytes)>,
+        mut sound_rx: mpsc::UnboundedReceiver<Vec<i16>>,
         mut pcm_producer: ringbuf::HeapProd<i16>,
         sample_rate: u32,
         jitter_frames: usize,
@@ -133,6 +135,8 @@ impl AudioBridge {
             let max_packets_per_speaker = (jitter_frames * 2).max(4);
             let mut dropped_samples: u64 = 0;
             let mut next_drop_log: u64 = sample_rate as u64; // ~1s of audio.
+            let mut sound_queue: VecDeque<i16> = VecDeque::new();
+            let mut sound_closed = false;
             let mut interval =
                 tokio::time::interval(Duration::from_millis(FRAME_DURATION_MS as u64));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -175,14 +179,22 @@ impl AudioBridge {
                             speakers.remove(&session_id);
                         }
 
-                        if active_speakers == 0 {
+                        // Mix in queued sound effect samples
+                        let has_sound = !sound_queue.is_empty();
+                        if has_sound {
+                            let drain_count = frame_samples.min(sound_queue.len());
+                            for sample in mix_accum.iter_mut().take(drain_count) {
+                                *sample += sound_queue.pop_front().unwrap() as i32;
+                            }
+                        }
+
+                        let active_sources = active_speakers + if has_sound { 1 } else { 0 };
+                        if active_sources == 0 {
                             continue;
                         }
 
-                        let divisor = active_speakers as i32;
                         for idx in 0..frame_samples {
-                            let mixed = mix_accum[idx] / divisor;
-                            mixed_frame[idx] = mixed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            mixed_frame[idx] = mix_accum[idx].clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         }
 
                         let written = pcm_producer.push_slice(&mixed_frame);
@@ -235,6 +247,17 @@ impl AudioBridge {
 
                         state.pending_packets.push_back(opus_data);
                         state.last_packet_at = Instant::now();
+                    }
+                    maybe_sound = sound_rx.recv(), if !sound_closed => {
+                        match maybe_sound {
+                            Some(pcm) => {
+                                trace!("Queued sound effect ({} samples)", pcm.len());
+                                sound_queue.extend(pcm);
+                            }
+                            None => {
+                                sound_closed = true;
+                            }
+                        }
                     }
                 }
             }
