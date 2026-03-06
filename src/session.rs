@@ -243,8 +243,7 @@ impl SessionManager {
                 let mut rx_closed = false;
                 if !announce_debounce.is_zero() {
                     loop {
-                        match tokio::time::timeout(announce_debounce, announcement_rx.recv())
-                            .await
+                        match tokio::time::timeout(announce_debounce, announcement_rx.recv()).await
                         {
                             // New channel-change arrived before timeout: update and
                             // restart debounce window from now.
@@ -287,13 +286,9 @@ impl SessionManager {
                             }
                         }
                     } else {
-                        warn!(
-                            "TTS is enabled but runtime is unavailable; falling back to connect sound"
-                        );
+                        warn!("TTS is enabled but runtime is unavailable");
                     }
                 }
-
-                let _ = tts_sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
 
                 if rx_closed {
                     break;
@@ -358,7 +353,7 @@ impl SessionManager {
                             // We changed channel (server confirmed).
                             // Use the previously confirmed self-channel from user_channels
                             // so DTMF watch updates do not suppress announcements.
-                            if old_channel != Some(channel_id) {
+                            if tts_enabled && old_channel != Some(channel_id) {
                                 let channel_name = channel_names.get(&channel_id).cloned();
                                 let _ = announcement_tx_events.send((channel_id, channel_name));
                             }
@@ -410,7 +405,7 @@ impl SessionManager {
         }
 
         // Initial connect announcement behavior.
-        if announce_on_connect {
+        if tts_enabled && announce_on_connect {
             let _ = announcement_tx.send((initial_channel_id, initial_channel_name));
         } else {
             let _ = sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));

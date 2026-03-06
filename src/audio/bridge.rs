@@ -13,6 +13,8 @@ pub const FRAME_DURATION_MS: u32 = 10;
 
 /// Maximum encoded Opus frame size in bytes.
 const MAX_OPUS_FRAME_SIZE: usize = 4000;
+/// Maximum Opus packet duration is 120ms; size decode buffers accordingly.
+const MAX_OPUS_FRAME_DURATION_MS: usize = 120;
 /// How often to log dropped frames to avoid log spam.
 const DROP_LOG_EVERY_FRAMES: u64 = 100;
 /// Average absolute sample threshold for transmission gating, matching mumble-web2.
@@ -41,6 +43,7 @@ enum TransmitState {
 struct SpeakerState {
     decoder: Decoder,
     pending_packets: VecDeque<Bytes>,
+    pending_pcm: VecDeque<i16>,
     last_packet_at: Instant,
     dropped_packets: u64,
 }
@@ -173,7 +176,9 @@ impl AudioBridge {
             let mut speakers: HashMap<u32, SpeakerState> = HashMap::new();
             let mut mix_accum = vec![0i32; frame_samples];
             let mut mixed_frame = vec![0i16; frame_samples];
-            let mut decode_buf = vec![0i16; frame_samples];
+            let max_decode_samples =
+                ((sample_rate as usize) * MAX_OPUS_FRAME_DURATION_MS / 1000).max(frame_samples);
+            let mut decode_buf = vec![0i16; max_decode_samples];
             let max_packets_per_speaker = (jitter_frames * 2).max(4);
             let mut dropped_samples: u64 = 0;
             let mut next_drop_log: u64 = sample_rate as u64; // ~1s of audio.
@@ -193,26 +198,38 @@ impl AudioBridge {
                         let mut stale_speakers = Vec::new();
 
                         for (session_id, state) in speakers.iter_mut() {
-                            let Some(opus_data) = state.pending_packets.pop_front() else {
-                                if now.duration_since(state.last_packet_at) > SPEAKER_IDLE_TIMEOUT {
+                            while state.pending_pcm.len() < frame_samples {
+                                let Some(opus_data) = state.pending_packets.pop_front() else {
+                                    break;
+                                };
+                                match state.decoder.decode(&opus_data, &mut decode_buf, false) {
+                                    Ok(decoded_samples) => {
+                                        if decoded_samples == 0 {
+                                            continue;
+                                        }
+                                        state.pending_pcm.extend(&decode_buf[..decoded_samples]);
+                                    }
+                                    Err(e) => {
+                                        warn!("Opus decode error for speaker {}: {}", session_id, e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if state.pending_pcm.is_empty() {
+                                if state.pending_packets.is_empty()
+                                    && now.duration_since(state.last_packet_at) > SPEAKER_IDLE_TIMEOUT
+                                {
                                     stale_speakers.push(*session_id);
                                 }
                                 continue;
-                            };
+                            }
 
-                            match state.decoder.decode(&opus_data, &mut decode_buf, false) {
-                                Ok(decoded_samples) => {
-                                    if decoded_samples == 0 {
-                                        continue;
-                                    }
-                                    active_speakers += 1;
-                                    let mix_len = decoded_samples.min(frame_samples);
-                                    for idx in 0..mix_len {
-                                        mix_accum[idx] += decode_buf[idx] as i32;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Opus decode error for speaker {}: {}", session_id, e);
+                            active_speakers += 1;
+                            let mix_len = frame_samples.min(state.pending_pcm.len());
+                            for idx in 0..mix_len {
+                                if let Some(sample) = state.pending_pcm.pop_front() {
+                                    mix_accum[idx] += sample as i32;
                                 }
                             }
                         }
@@ -269,6 +286,7 @@ impl AudioBridge {
                                 entry.insert(SpeakerState {
                                     decoder,
                                     pending_packets: VecDeque::new(),
+                                    pending_pcm: VecDeque::new(),
                                     last_packet_at: Instant::now(),
                                     dropped_packets: 0,
                                 })
