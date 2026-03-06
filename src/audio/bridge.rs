@@ -5,10 +5,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
 /// Opus frame duration in milliseconds.
-const FRAME_DURATION_MS: usize = 20;
+/// Mumble uses 10ms frames (iFrameSize = SAMPLE_RATE / 100 = 480).
+const FRAME_DURATION_MS: usize = 10;
 
-/// Samples per Opus frame at 48kHz mono (20ms).
-const SAMPLES_PER_FRAME: usize = 48000 * FRAME_DURATION_MS / 1000; // 960
+/// Samples per Opus frame at 48kHz mono (10ms).
+const SAMPLES_PER_FRAME: usize = 48000 * FRAME_DURATION_MS / 1000; // 480
 
 /// Maximum encoded Opus frame size in bytes.
 const MAX_OPUS_FRAME_SIZE: usize = 4000;
@@ -47,23 +48,20 @@ impl AudioBridge {
             let mut pcm_buf = vec![0i16; SAMPLES_PER_FRAME];
             let mut opus_buf = vec![0u8; MAX_OPUS_FRAME_SIZE];
 
-            // Poll frequently but only encode when a full frame is available.
-            // This avoids timer drift vs pjsip's put_frame cadence.
+            // Poll at 5ms for low latency — encode and send as soon as a
+            // full frame is available. Mumble handles jitter on its end.
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(5));
 
             loop {
                 interval.tick().await;
 
-                // Wait until we have a full frame of samples
+                // Need a full frame to encode
                 if pcm_consumer.occupied_len() < SAMPLES_PER_FRAME {
                     continue;
                 }
 
                 let read = pcm_consumer.pop_slice(&mut pcm_buf);
-                debug_assert!(read >= SAMPLES_PER_FRAME);
-
-                // Zero-fill if somehow short
                 if read < SAMPLES_PER_FRAME {
                     pcm_buf[read..].fill(0);
                 }
@@ -76,6 +74,8 @@ impl AudioBridge {
                             debug!("Opus output channel closed, stopping encoder");
                             break;
                         }
+                        // Mumble seq_num is a frame counter — the server multiplies
+                        // it by frame size internally for jitter buffer timestamps.
                         seq_num += 1;
                     }
                     Err(e) => {

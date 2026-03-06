@@ -14,15 +14,17 @@ use crate::sip;
 use crate::sip::callbacks;
 use crate::sip::media_port;
 
-/// Wrapper to make raw pjmedia_port pointer Send.
+/// Wrapper to make raw pjmedia_port pointer Send+Sync.
 /// Safety: the pointer is only accessed from pjsip's media thread (via callbacks)
 /// or when we explicitly destroy it during session teardown (under Mutex).
 struct SendablePort(*mut pjmedia_port);
 unsafe impl Send for SendablePort {}
+unsafe impl Sync for SendablePort {}
 
-/// Wrapper to make raw pj_pool_t pointer Send.
+/// Wrapper to make raw pj_pool_t pointer Send+Sync.
 struct SendablePool(*mut pj_pool_t);
 unsafe impl Send for SendablePool {}
+unsafe impl Sync for SendablePool {}
 
 /// A single active call session, bridging one SIP call to one Mumble connection.
 struct CallSession {
@@ -37,6 +39,35 @@ struct CallSession {
     decoder_handle: JoinHandle<()>,
     voice_forward_handle: JoinHandle<()>,
     mumble_event_handle: JoinHandle<()>,
+}
+
+/// Deferred cleanup data for conference bridge ports.
+/// Raw pointers are safe to send because they're only accessed after
+/// a delay that ensures pjsip's clock thread is done with them.
+struct DeferredCleanup {
+    port: *mut pjmedia_port,
+    pool: Option<*mut pj_pool_t>,
+}
+unsafe impl Send for DeferredCleanup {}
+
+impl DeferredCleanup {
+    /// Run the deferred cleanup after a delay, on a dedicated thread.
+    fn spawn_deferred(self) {
+        std::thread::spawn(move || {
+            self.run();
+        });
+    }
+
+    fn run(self) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        sip::ensure_pj_thread_registered();
+        unsafe {
+            media_port::destroy_custom_port(self.port);
+            if let Some(pool) = self.pool {
+                pj_pool_release(pool);
+            }
+        }
+    }
 }
 
 /// Manages all active call sessions.
@@ -228,28 +259,25 @@ impl SessionManager {
         session.voice_forward_handle.abort();
         session.mumble_event_handle.abort();
 
-        // Remove from conference bridge. This is an async operation — pjsip
-        // queues the removal and processes it on the next clock tick. The
-        // on_destroy callback will free the PortUserData when pjsip is done.
         if let Some(port_id) = session.conf_port_id {
+            // Remove from conference bridge. pjsip queues the removal and
+            // processes it on the next clock tick. We must defer all cleanup
+            // until after that tick completes.
             unsafe {
                 pjsua_conf_remove_port(port_id);
             }
-            // Port was in the conference bridge — on_destroy handles user data
-            // cleanup. We must NOT free the port struct here because pjsip's
-            // clock thread may still reference it until the queued removal is
-            // processed. The port struct (~200 bytes) is intentionally leaked.
+
+            // Spawn a deferred cleanup task. The conference bridge clock runs
+            // at 20ms ticks, so waiting 100ms ensures the queued removal has
+            // been processed and pjsip no longer references our port.
+            DeferredCleanup {
+                port: session.media_port.0,
+                pool: session.conf_pool.map(|SendablePool(p)| p),
+            }.spawn_deferred();
         } else {
             // Port was never added to conference bridge — clean up directly.
             unsafe {
                 media_port::destroy_custom_port(session.media_port.0);
-            }
-        }
-
-        // Release the conference port pool.
-        if let Some(SendablePool(pool)) = session.conf_pool {
-            unsafe {
-                pj_pool_release(pool);
             }
         }
     }
