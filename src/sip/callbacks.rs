@@ -1,8 +1,9 @@
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use pjsip_sys::*;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Events sent from pjsua's callback thread to the tokio async world.
 #[derive(Debug)]
@@ -17,13 +18,50 @@ pub enum SipEvent {
         call_id: pjsua_call_id,
         state: u32,
     },
-    CallMediaStateChanged {
+    CallMediaActive {
         call_id: pjsua_call_id,
+        conf_port_id: pjsua_conf_port_id,
+        pool: *mut pj_pool_t,
     },
 }
 
+// Safety: SipEvent contains raw pointers only in CallMediaActive, which is
+// created on pjsip's thread and consumed on tokio's main task. The pool pointer
+// is only used for cleanup (pj_pool_release) on a pj-registered thread.
+unsafe impl Send for SipEvent {}
+
 /// Global sender for bridging pjsua callbacks into tokio.
 static EVENT_TX: OnceLock<mpsc::UnboundedSender<SipEvent>> = OnceLock::new();
+
+/// Wrapper to make raw pjmedia_port pointer Send+Sync for storage in a static.
+/// Safety: the pointer is only written from tokio and read from pjsip's callback thread,
+/// synchronized via Mutex.
+struct SendablePort(*mut pjmedia_port);
+unsafe impl Send for SendablePort {}
+unsafe impl Sync for SendablePort {}
+
+/// Global registry of media ports waiting to be connected to the conference bridge.
+/// Entries are inserted by SessionManager (from tokio) and consumed by the
+/// on_call_media_state callback (from pjsip's thread).
+static PENDING_PORTS: OnceLock<Mutex<HashMap<pjsua_call_id, SendablePort>>> = OnceLock::new();
+
+fn pending_ports() -> &'static Mutex<HashMap<pjsua_call_id, SendablePort>> {
+    PENDING_PORTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a media port to be connected when the call's media becomes active.
+///
+/// # Safety
+/// The `port` pointer must remain valid until it is consumed by the callback
+/// or removed via `unregister_pending_port`.
+pub fn register_pending_port(call_id: pjsua_call_id, port: *mut pjmedia_port) {
+    pending_ports().lock().unwrap().insert(call_id, SendablePort(port));
+}
+
+/// Remove a pending port registration (e.g. on call teardown before media was connected).
+pub fn unregister_pending_port(call_id: pjsua_call_id) {
+    pending_ports().lock().unwrap().remove(&call_id);
+}
 
 /// Initialize the global callback channel. Must be called before pjsua_init.
 pub(super) fn init_callbacks() -> mpsc::UnboundedReceiver<SipEvent> {
@@ -127,8 +165,62 @@ unsafe extern "C" fn on_call_state(call_id: pjsua_call_id, _e: *mut pjsip_event)
 }
 
 /// C callback: call media state changed.
+/// Runs on pjsip's thread, so we can safely call pjsua_conf_* functions here.
 unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
     debug!("Call {} media state changed", call_id);
 
-    send_event(SipEvent::CallMediaStateChanged { call_id });
+    // Take the pending port for this call (if any)
+    let sendable = pending_ports().lock().unwrap().remove(&call_id);
+    let Some(SendablePort(port)) = sendable else {
+        debug!("No pending media port for call {}", call_id);
+        return;
+    };
+
+    unsafe {
+        let call_conf_port = pjsua_call_get_conf_port(call_id);
+        if call_conf_port < 0 {
+            warn!("Call {} has no conference port yet", call_id);
+            // Put it back so we can try again on the next media state change
+            pending_ports().lock().unwrap().insert(call_id, SendablePort(port));
+            return;
+        }
+
+        // Create a memory pool for this port's conference bridge slot
+        let pool_name = std::ffi::CString::new(format!("mumb-call{}", call_id)).unwrap();
+        let pool = pjsua_pool_create(pool_name.as_ptr(), 512, 512);
+        if pool.is_null() {
+            error!("Failed to create pool for call {} media port", call_id);
+            return;
+        }
+
+        // Add our custom port to the conference bridge
+        let mut port_id: pjsua_conf_port_id = 0;
+        let status = pjsua_conf_add_port(pool, port, &mut port_id);
+        if status != 0 {
+            error!("Failed to add media port to conference: status={}", status);
+            return;
+        }
+
+        // Connect bidirectionally: call <-> custom port
+        let status = pjsua_conf_connect(call_conf_port, port_id);
+        if status != 0 {
+            error!("Failed to connect call->bridge: status={}", status);
+        }
+        let status = pjsua_conf_connect(port_id, call_conf_port);
+        if status != 0 {
+            error!("Failed to connect bridge->call: status={}", status);
+        }
+
+        info!(
+            "Call {} audio bridge connected (conf_port={})",
+            call_id, port_id
+        );
+
+        // Notify the session manager about the conf port ID and pool for cleanup
+        send_event(SipEvent::CallMediaActive {
+            call_id,
+            conf_port_id: port_id,
+            pool,
+        });
+    }
 }

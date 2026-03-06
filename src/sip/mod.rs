@@ -1,12 +1,46 @@
 pub mod callbacks;
 pub mod media_port;
 
+use std::cell::RefCell;
 use std::ffi::CString;
 
 use pjsip_sys::*;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::sip::callbacks::SipEvent;
+
+/// Register the current (external) thread with pjlib so that pjsua API calls
+/// can be made from it. Uses thread-local storage to ensure each thread is
+/// registered at most once. The pj_thread_desc must live as long as the thread.
+pub fn ensure_pj_thread_registered() {
+    thread_local! {
+        static REGISTERED: RefCell<Option<Box<pj_thread_desc>>> = const { RefCell::new(None) };
+    }
+
+    REGISTERED.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_some() {
+            return; // Already registered
+        }
+
+        unsafe {
+            if pj_thread_is_registered() != 0 {
+                return; // Already known to pjlib
+            }
+
+            let mut desc = Box::new(std::mem::zeroed::<pj_thread_desc>());
+            let mut thread: *mut pj_thread_t = std::ptr::null_mut();
+            let name = CString::new("tokio-worker").unwrap();
+            let status = pj_thread_register(name.as_ptr(), desc.as_mut_ptr(), &mut thread);
+            if status != 0 {
+                warn!("pj_thread_register failed: {}", status);
+                return;
+            }
+            // Keep the desc alive for the lifetime of the thread
+            *slot = Some(desc);
+        }
+    });
+}
 
 /// Helper to create a pj_str_t from a Rust string.
 /// The CString must be kept alive as long as the pj_str_t is in use.

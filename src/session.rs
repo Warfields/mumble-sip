@@ -10,6 +10,8 @@ use tracing::{debug, error, info, warn};
 use crate::audio::bridge::AudioBridge;
 use crate::config::Config;
 use crate::mumble::control::{MumbleClient, MumbleEvent};
+use crate::sip;
+use crate::sip::callbacks;
 use crate::sip::media_port;
 
 /// Wrapper to make raw pjmedia_port pointer Send.
@@ -18,10 +20,16 @@ use crate::sip::media_port;
 struct SendablePort(*mut pjmedia_port);
 unsafe impl Send for SendablePort {}
 
+/// Wrapper to make raw pj_pool_t pointer Send.
+struct SendablePool(*mut pj_pool_t);
+unsafe impl Send for SendablePool {}
+
 /// A single active call session, bridging one SIP call to one Mumble connection.
 struct CallSession {
     /// Conference port ID for the custom media port.
     conf_port_id: Option<pjsua_conf_port_id>,
+    /// Pool allocated for the conference port (must be released on teardown).
+    conf_pool: Option<SendablePool>,
     /// Raw pointer to the custom pjmedia_port (we own this memory).
     media_port: SendablePort,
     /// Task handles for cleanup.
@@ -59,6 +67,8 @@ impl SessionManager {
                     "Max concurrent calls ({}) reached, rejecting call {}",
                     self.config.sip.max_concurrent_calls, call_id
                 );
+                // Register thread with pjlib before calling pjsua (may be any tokio worker)
+                sip::ensure_pj_thread_registered();
                 unsafe {
                     pjsua_call_hangup(call_id, 486, std::ptr::null(), std::ptr::null());
                 }
@@ -80,6 +90,8 @@ impl SessionManager {
             Ok(client) => client,
             Err(e) => {
                 error!("Failed to connect to Mumble for call {}: {}", call_id, e);
+                // Re-register thread — we may have resumed on a different worker after await
+                sip::ensure_pj_thread_registered();
                 unsafe {
                     pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
                 }
@@ -147,7 +159,12 @@ impl SessionManager {
             }
         });
 
-        // Answer the SIP call
+        // Register the media port so the pjsip callback thread can attach it
+        // to the conference bridge when media becomes active
+        callbacks::register_pending_port(call_id, media_port);
+
+        // Answer the SIP call — re-register thread since we may have crossed an await boundary
+        sip::ensure_pj_thread_registered();
         unsafe {
             let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
             if status != 0 {
@@ -158,6 +175,7 @@ impl SessionManager {
         // Store the session
         let session = CallSession {
             conf_port_id: None,
+            conf_pool: None,
             media_port: SendablePort(media_port),
             encoder_handle,
             decoder_handle,
@@ -171,58 +189,23 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Handle call media state change — attach the custom media port to the conference bridge.
-    pub fn on_call_media_state(&self, call_id: pjsua_call_id) {
+    /// Record the conference port ID and pool assigned by the pjsip callback thread.
+    pub fn on_call_media_active(
+        &self,
+        call_id: pjsua_call_id,
+        conf_port_id: pjsua_conf_port_id,
+        pool: *mut pj_pool_t,
+    ) {
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get_mut(&call_id) else {
-            warn!("Media state changed for unknown call {}", call_id);
-            return;
-        };
-
-        if session.conf_port_id.is_some() {
-            debug!("Call {} media port already connected", call_id);
-            return;
-        }
-
-        unsafe {
-            let call_conf_port = pjsua_call_get_conf_port(call_id);
-            if call_conf_port < 0 {
-                warn!("Call {} has no conference port yet", call_id);
-                return;
-            }
-
-            // Add our custom port to the conference bridge
-            let mut port_id: pjsua_conf_port_id = 0;
-            let status = pjsua_conf_add_port(
-                std::ptr::null_mut(), // use default pool
-                session.media_port.0,
-                &mut port_id,
-            );
-            if status != 0 {
-                error!("Failed to add media port to conference: status={}", status);
-                return;
-            }
-
-            // Connect bidirectionally: call <-> custom port
-            let status = pjsua_conf_connect(call_conf_port, port_id);
-            if status != 0 {
-                error!("Failed to connect call->bridge: status={}", status);
-            }
-            let status = pjsua_conf_connect(port_id, call_conf_port);
-            if status != 0 {
-                error!("Failed to connect bridge->call: status={}", status);
-            }
-
-            session.conf_port_id = Some(port_id);
-            info!(
-                "Call {} audio bridge connected (conf_port={})",
-                call_id, port_id
-            );
+        if let Some(session) = sessions.get_mut(&call_id) {
+            session.conf_port_id = Some(conf_port_id);
+            session.conf_pool = Some(SendablePool(pool));
         }
     }
 
     /// Handle call disconnection — tear down the session.
     pub fn on_call_disconnected(&self, call_id: pjsua_call_id) {
+        sip::ensure_pj_thread_registered();
         let session = self.sessions.lock().unwrap().remove(&call_id);
         let Some(session) = session else {
             return;
@@ -230,10 +213,20 @@ impl SessionManager {
 
         info!("Tearing down session for call {}", call_id);
 
+        // Clean up any pending port registration that wasn't consumed
+        callbacks::unregister_pending_port(call_id);
+
         // Remove from conference bridge
         if let Some(port_id) = session.conf_port_id {
             unsafe {
                 pjsua_conf_remove_port(port_id);
+            }
+        }
+
+        // Release the conference port pool
+        if let Some(SendablePool(pool)) = session.conf_pool {
+            unsafe {
+                pj_pool_release(pool);
             }
         }
 

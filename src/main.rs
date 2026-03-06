@@ -54,8 +54,12 @@ async fn main() -> anyhow::Result<()> {
                     session_mgr.on_call_disconnected(call_id);
                 }
             }
-            SipEvent::CallMediaStateChanged { call_id } => {
-                session_mgr.on_call_media_state(call_id);
+            SipEvent::CallMediaActive {
+                call_id,
+                conf_port_id,
+                pool,
+            } => {
+                session_mgr.on_call_media_active(call_id, conf_port_id, pool);
             }
         }
     }
