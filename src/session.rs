@@ -221,20 +221,29 @@ impl SessionManager {
         // Clean up any pending port registration that wasn't consumed
         callbacks::unregister_pending_port(call_id);
 
-        // Remove from conference bridge — this acquires the group lock so the
-        // clock thread is not mid-callback when we proceed to destroy the port.
-        // pjsua_conf_remove_port does NOT call pjmedia_port_destroy, so the
-        // port and its user data are still valid after this call.
+        // Abort async tasks first — this drops the ring buffer halves owned
+        // by tokio tasks, preventing further reads/writes.
+        session.encoder_handle.abort();
+        session.decoder_handle.abort();
+        session.voice_forward_handle.abort();
+        session.mumble_event_handle.abort();
+
+        // Remove from conference bridge. This is an async operation — pjsip
+        // queues the removal and processes it on the next clock tick. The
+        // on_destroy callback will free the PortUserData when pjsip is done.
         if let Some(port_id) = session.conf_port_id {
             unsafe {
                 pjsua_conf_remove_port(port_id);
             }
-        }
-
-        // Now safe to destroy the port — clock thread no longer references it.
-        // This frees the PortUserData and the heap-allocated pjmedia_port struct.
-        unsafe {
-            media_port::destroy_custom_port(session.media_port.0);
+            // Port was in the conference bridge — on_destroy handles user data
+            // cleanup. We must NOT free the port struct here because pjsip's
+            // clock thread may still reference it until the queued removal is
+            // processed. The port struct (~200 bytes) is intentionally leaked.
+        } else {
+            // Port was never added to conference bridge — clean up directly.
+            unsafe {
+                media_port::destroy_custom_port(session.media_port.0);
+            }
         }
 
         // Release the conference port pool.
@@ -243,11 +252,5 @@ impl SessionManager {
                 pj_pool_release(pool);
             }
         }
-
-        // Abort async tasks
-        session.encoder_handle.abort();
-        session.decoder_handle.abort();
-        session.voice_forward_handle.abort();
-        session.mumble_event_handle.abort();
     }
 }

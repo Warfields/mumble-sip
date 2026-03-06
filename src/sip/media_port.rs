@@ -105,22 +105,31 @@ pub unsafe fn create_custom_port(
     Ok(port)
 }
 
-/// Clean up a custom port that was NOT added to the conference bridge
-/// (or has already been removed). If the port was in the conference bridge,
-/// `pjsua_conf_remove_port` triggers `port_on_destroy` which frees the user data,
-/// so only the port struct itself needs freeing here.
+/// Clean up a custom port's user data and free the port struct.
+///
+/// If the port was added to the conference bridge, the caller MUST call
+/// `pjsua_conf_remove_port` first. This function cleans up the Rust-side
+/// allocations (user data + the Box-allocated port struct).
 pub unsafe fn destroy_custom_port(port: *mut pjmedia_port) {
-    if !port.is_null() {
-        // Free user data only if on_destroy hasn't already done it
-        let pdata = unsafe { (*port).port_data.pdata };
-        if !pdata.is_null() {
-            unsafe {
-                drop(Box::from_raw(pdata as *mut PortUserData));
-                (*port).port_data.pdata = std::ptr::null_mut();
-            }
-        }
-        unsafe { drop(Box::from_raw(port)) };
+    if port.is_null() {
+        return;
     }
+    // Free user data only if on_destroy hasn't already done it
+    let pdata = unsafe { (*port).port_data.pdata };
+    if !pdata.is_null() {
+        unsafe {
+            drop(Box::from_raw(pdata as *mut PortUserData));
+            (*port).port_data.pdata = std::ptr::null_mut();
+        }
+    }
+    // Null out callbacks to prevent use-after-free if pjsip still
+    // holds a stale reference during the clock thread's current tick
+    unsafe {
+        (*port).put_frame = None;
+        (*port).get_frame = None;
+        (*port).on_destroy = None;
+    }
+    unsafe { drop(Box::from_raw(port)) };
 }
 
 /// put_frame: called by pjsip media thread when there's audio FROM the SIP caller.
