@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use pjsip_sys::*;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -110,7 +111,19 @@ impl SessionManager {
             mumble_config.username = number.clone();
         }
         let sample_rate = self.config.audio.sample_rate;
-        let samples_per_frame = sample_rate * self.config.audio.frame_duration_ms / 1000;
+        let configured_frame_ms = self.config.audio.frame_duration_ms;
+        if configured_frame_ms != crate::audio::bridge::FRAME_DURATION_MS {
+            warn!(
+                "audio.frame_duration_ms={}ms is not supported by bridge, forcing {}ms",
+                configured_frame_ms,
+                crate::audio::bridge::FRAME_DURATION_MS
+            );
+        }
+        let samples_per_frame = sample_rate * crate::audio::bridge::FRAME_DURATION_MS / 1000;
+        let jitter_frames = (self.config.audio.jitter_buffer_ms
+            / crate::audio::bridge::FRAME_DURATION_MS)
+            .max(2) as usize;
+        let queue_capacity = (jitter_frames * 2).max(8);
 
         info!(
             "Setting up session for call {} -> Mumble {}:{}",
@@ -153,7 +166,7 @@ impl SessionManager {
         };
 
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
-        let (opus_encoded_tx, mut opus_encoded_rx) = mpsc::unbounded_channel::<(u64, Bytes)>();
+        let (opus_encoded_tx, mut opus_encoded_rx) = mpsc::channel::<(u64, Bytes)>(queue_capacity);
         let opus_bitrate = self.config.audio.opus_bitrate;
         let encoder_handle = AudioBridge::spawn_encoder(
             buffers.sip_to_mumble_cons,
@@ -174,22 +187,40 @@ impl SessionManager {
         });
 
         // Channel to feed decoded Opus into the decoder
-        let (opus_to_decoder_tx, opus_to_decoder_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (opus_to_decoder_tx, opus_to_decoder_rx) =
+            mpsc::channel::<(u32, Bytes)>(queue_capacity);
 
-        // Spawn decoder: decodes Opus from Mumble, writes PCM into Mumble→SIP ring buffer
-        let decoder_handle =
-            AudioBridge::spawn_decoder(opus_to_decoder_rx, buffers.mumble_to_sip_prod, sample_rate);
+        // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
+        let decoder_handle = AudioBridge::spawn_mixed_decoder(
+            opus_to_decoder_rx,
+            buffers.mumble_to_sip_prod,
+            sample_rate,
+            jitter_frames,
+        );
 
         // Spawn Mumble event handler: receives audio events and feeds them to the decoder
         let opus_tx = opus_to_decoder_tx.clone();
         let mumble_event_handle = tokio::spawn(async move {
+            let mut dropped_decoder_frames: u64 = 0;
             while let Some(event) = mumble.recv_event().await {
                 match event {
-                    MumbleEvent::AudioReceived { opus_data, .. } => {
-                        if opus_tx.send(opus_data).is_err() {
-                            break;
+                    MumbleEvent::AudioReceived {
+                        session_id,
+                        opus_data,
+                        ..
+                    } => match opus_tx.try_send((session_id, opus_data)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            dropped_decoder_frames += 1;
+                            if dropped_decoder_frames % 100 == 0 {
+                                warn!(
+                                    "Call {}: dropped {} Mumble Opus frames before mixer due to full queue",
+                                    call_id, dropped_decoder_frames
+                                );
+                            }
                         }
-                    }
+                        Err(TrySendError::Closed(_)) => break,
+                    },
                     MumbleEvent::Disconnected => {
                         info!("Mumble disconnected for call event loop");
                         break;

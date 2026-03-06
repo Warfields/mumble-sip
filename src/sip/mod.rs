@@ -96,10 +96,7 @@ impl PjsuaEndpoint {
             media_cfg.snd_clock_rate = 48000;
             media_cfg.no_vad = 1; // Disable VAD — we always stream
 
-            check_status(
-                pjsua_init(&ua_cfg, &log_cfg, &media_cfg),
-                "pjsua_init",
-            )?;
+            check_status(pjsua_init(&ua_cfg, &log_cfg, &media_cfg), "pjsua_init")?;
             debug!("pjsua initialized");
 
             // Create UDP transport
@@ -147,10 +144,7 @@ impl PjsuaEndpoint {
             acc_cfg.cred_info[0].data = pj_str_from_cstring(&password_cstr);
 
             let mut acc_id: pjsua_acc_id = 0;
-            check_status(
-                pjsua_acc_add(&acc_cfg, 1, &mut acc_id),
-                "pjsua_acc_add",
-            )?;
+            check_status(pjsua_acc_add(&acc_cfg, 1, &mut acc_id), "pjsua_acc_add")?;
             info!("SIP account registered (acc_id={})", acc_id);
 
             Ok((PjsuaEndpoint { _acc_id: acc_id }, event_rx))
@@ -174,11 +168,7 @@ fn check_status(status: pj_status_t, context: &str) -> anyhow::Result<()> {
         // Get error message from pjsip
         let mut buf = [0u8; 256];
         unsafe {
-            let err_str = pj_strerror(
-                status,
-                buf.as_mut_ptr() as *mut _,
-                buf.len() as pj_size_t,
-            );
+            let err_str = pj_strerror(status, buf.as_mut_ptr() as *mut _, buf.len() as pj_size_t);
             let msg = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
                 err_str.ptr as *const u8,
                 err_str.slen as usize,

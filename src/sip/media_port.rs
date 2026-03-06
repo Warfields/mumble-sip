@@ -1,9 +1,27 @@
 use std::ffi::CString;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pjsip_sys::*;
-use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
+use ringbuf::traits::{Consumer, Producer, Split};
+use tracing::warn;
+
+static SIP_TO_MUMBLE_DROPPED_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static MUMBLE_TO_SIP_UNDERFLOW_SAMPLES: AtomicU64 = AtomicU64::new(0);
+const TELEMETRY_LOG_STEP_SAMPLES: u64 = 48_000; // ~1s at 48kHz.
+
+fn track_samples(counter: &AtomicU64, delta: u64, label: &str) {
+    if delta == 0 {
+        return;
+    }
+
+    let prev = counter.fetch_add(delta, Ordering::Relaxed);
+    let total = prev + delta;
+    if total / TELEMETRY_LOG_STEP_SAMPLES != prev / TELEMETRY_LOG_STEP_SAMPLES {
+        warn!("Audio telemetry: {} (total_samples={})", label, total);
+    }
+}
 
 /// Shared ring buffer pair for passing PCM between pjsip's media thread and tokio.
 ///
@@ -77,7 +95,7 @@ pub unsafe fn create_custom_port(
             &name_str,
             signature,
             clock_rate,
-            1, // mono
+            1,  // mono
             16, // 16-bit PCM
             samples_per_frame,
         );
@@ -155,11 +173,17 @@ unsafe extern "C" fn port_put_frame(
     let user_data = unsafe { &mut *(pdata as *mut PortUserData) };
 
     let samples_count = frame.size / std::mem::size_of::<i16>();
-    let samples =
-        unsafe { std::slice::from_raw_parts(frame.buf as *const i16, samples_count) };
+    let samples = unsafe { std::slice::from_raw_parts(frame.buf as *const i16, samples_count) };
 
     // Push samples into ring buffer. If full, samples are dropped (acceptable for real-time audio).
-    let _ = user_data.sip_to_mumble.push_slice(samples);
+    let written = user_data.sip_to_mumble.push_slice(samples);
+    if written < samples_count {
+        track_samples(
+            &SIP_TO_MUMBLE_DROPPED_SAMPLES,
+            (samples_count - written) as u64,
+            "SIP->Mumble ring overflow dropped samples",
+        );
+    }
 
     0 // PJ_SUCCESS
 }
@@ -182,9 +206,7 @@ unsafe extern "C" fn port_get_frame(
     let user_data = unsafe { &mut *(pdata as *mut PortUserData) };
 
     let samples_count = frame.size / std::mem::size_of::<i16>();
-    let buf = unsafe {
-        std::slice::from_raw_parts_mut(frame.buf as *mut i16, samples_count)
-    };
+    let buf = unsafe { std::slice::from_raw_parts_mut(frame.buf as *mut i16, samples_count) };
 
     let read = user_data.mumble_to_sip.pop_slice(buf);
 
@@ -192,10 +214,20 @@ unsafe extern "C" fn port_get_frame(
         // No data available — fill with silence
         buf.fill(0);
         frame.type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_NONE;
+        track_samples(
+            &MUMBLE_TO_SIP_UNDERFLOW_SAMPLES,
+            samples_count as u64,
+            "Mumble->SIP ring underflow inserted silence",
+        );
     } else {
         // If we got fewer samples than requested, zero-fill the rest
         if read < samples_count {
             buf[read..].fill(0);
+            track_samples(
+                &MUMBLE_TO_SIP_UNDERFLOW_SAMPLES,
+                (samples_count - read) as u64,
+                "Mumble->SIP partial underflow inserted silence",
+            );
         }
         frame.type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
     }

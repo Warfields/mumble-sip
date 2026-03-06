@@ -1,23 +1,38 @@
 use bytes::Bytes;
 use opus::{Application, Channels, Decoder, Encoder};
 use ringbuf::traits::{Consumer, Observer, Producer};
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, warn};
 
 /// Opus frame duration in milliseconds.
 /// Mumble uses 10ms frames (iFrameSize = SAMPLE_RATE / 100 = 480).
-const FRAME_DURATION_MS: usize = 10;
-
-/// Samples per Opus frame at 48kHz mono (10ms).
-const SAMPLES_PER_FRAME: usize = 48000 * FRAME_DURATION_MS / 1000; // 480
+pub const FRAME_DURATION_MS: u32 = 10;
 
 /// Maximum encoded Opus frame size in bytes.
 const MAX_OPUS_FRAME_SIZE: usize = 4000;
+/// How often to log dropped frames to avoid log spam.
+const DROP_LOG_EVERY_FRAMES: u64 = 100;
+/// Remove idle speaker decoders after this long without packets.
+const SPEAKER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn frame_samples(sample_rate: u32) -> usize {
+    ((sample_rate as usize) * (FRAME_DURATION_MS as usize)) / 1000
+}
 
 /// Audio bridge that runs two async tasks:
 /// 1. Encoder: reads PCM from ring buffer → encodes Opus → sends to Mumble
 /// 2. Decoder: receives Opus from Mumble → decodes to PCM → writes to ring buffer
 pub struct AudioBridge;
+
+struct SpeakerState {
+    decoder: Decoder,
+    pending_packets: VecDeque<Bytes>,
+    last_packet_at: Instant,
+    dropped_packets: u64,
+}
 
 impl AudioBridge {
     /// Spawn the encoder task: reads PCM from the SIP→Mumble ring buffer,
@@ -26,7 +41,7 @@ impl AudioBridge {
     /// Returns a JoinHandle for the spawned task.
     pub fn spawn_encoder(
         mut pcm_consumer: ringbuf::HeapCons<i16>,
-        opus_tx: mpsc::UnboundedSender<(u64, Bytes)>,
+        opus_tx: mpsc::Sender<(u64, Bytes)>,
         sample_rate: u32,
         opus_bitrate: u32,
     ) -> tokio::task::JoinHandle<()> {
@@ -44,25 +59,26 @@ impl AudioBridge {
                 }
             };
 
+            let frame_samples = frame_samples(sample_rate);
             let mut seq_num: u64 = 0;
-            let mut pcm_buf = vec![0i16; SAMPLES_PER_FRAME];
+            let mut dropped_frames: u64 = 0;
+            let mut pcm_buf = vec![0i16; frame_samples];
             let mut opus_buf = vec![0u8; MAX_OPUS_FRAME_SIZE];
 
             // Poll at 5ms for low latency — encode and send as soon as a
             // full frame is available. Mumble handles jitter on its end.
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_millis(5));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(5));
 
             loop {
                 interval.tick().await;
 
                 // Need a full frame to encode
-                if pcm_consumer.occupied_len() < SAMPLES_PER_FRAME {
+                if pcm_consumer.occupied_len() < frame_samples {
                     continue;
                 }
 
                 let read = pcm_consumer.pop_slice(&mut pcm_buf);
-                if read < SAMPLES_PER_FRAME {
+                if read < frame_samples {
                     pcm_buf[read..].fill(0);
                 }
 
@@ -70,9 +86,21 @@ impl AudioBridge {
                 match encoder.encode(&pcm_buf, &mut opus_buf) {
                     Ok(encoded_len) => {
                         let opus_data = Bytes::copy_from_slice(&opus_buf[..encoded_len]);
-                        if opus_tx.send((seq_num, opus_data)).is_err() {
-                            debug!("Opus output channel closed, stopping encoder");
-                            break;
+                        match opus_tx.try_send((seq_num, opus_data)) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                dropped_frames += 1;
+                                if dropped_frames % DROP_LOG_EVERY_FRAMES == 0 {
+                                    warn!(
+                                        "Dropped {} SIP->Mumble Opus frames due to full queue",
+                                        dropped_frames
+                                    );
+                                }
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                debug!("Opus output channel closed, stopping encoder");
+                                break;
+                            }
                         }
                         // Mumble seq_num is a frame counter — the server multiplies
                         // it by frame size internally for jitter buffer timestamps.
@@ -86,42 +114,132 @@ impl AudioBridge {
         })
     }
 
-    /// Spawn the decoder task: receives Opus frames and decodes them to PCM,
-    /// writing into the Mumble→SIP ring buffer.
-    ///
-    /// Returns a JoinHandle for the spawned task.
-    pub fn spawn_decoder(
-        mut opus_rx: mpsc::UnboundedReceiver<Bytes>,
+    /// Spawn a mixed decoder task:
+    /// - decodes each speaker using its own Opus decoder state
+    /// - mixes active speakers into one 10ms PCM frame
+    /// - outputs exactly one mixed frame per tick to match realtime playout
+    pub fn spawn_mixed_decoder(
+        mut opus_rx: mpsc::Receiver<(u32, Bytes)>,
         mut pcm_producer: ringbuf::HeapProd<i16>,
         sample_rate: u32,
+        jitter_frames: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut decoder = match Decoder::new(sample_rate, Channels::Mono) {
-                Ok(dec) => dec,
-                Err(e) => {
-                    error!("Failed to create Opus decoder: {}", e);
-                    return;
-                }
-            };
+            let frame_samples = frame_samples(sample_rate);
+            let mut speakers: HashMap<u32, SpeakerState> = HashMap::new();
+            let mut mix_accum = vec![0i32; frame_samples];
+            let mut mixed_frame = vec![0i16; frame_samples];
+            let mut decode_buf = vec![0i16; frame_samples];
+            let max_packets_per_speaker = (jitter_frames * 2).max(4);
+            let mut dropped_samples: u64 = 0;
+            let mut next_drop_log: u64 = sample_rate as u64; // ~1s of audio.
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(FRAME_DURATION_MS as u64));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-            let mut pcm_buf = vec![0i16; SAMPLES_PER_FRAME];
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = interval.tick() => {
+                        mix_accum.fill(0);
+                        let mut active_speakers: usize = 0;
+                        let now = Instant::now();
+                        let mut stale_speakers = Vec::new();
 
-            while let Some(opus_data) = opus_rx.recv().await {
-                match decoder.decode(&opus_data, &mut pcm_buf, false) {
-                    Ok(decoded_samples) => {
-                        let written = pcm_producer.push_slice(&pcm_buf[..decoded_samples]);
-                        if written < decoded_samples {
-                            // Ring buffer full — dropping oldest samples is acceptable
-                            // for real-time audio
+                        for (session_id, state) in speakers.iter_mut() {
+                            let Some(opus_data) = state.pending_packets.pop_front() else {
+                                if now.duration_since(state.last_packet_at) > SPEAKER_IDLE_TIMEOUT {
+                                    stale_speakers.push(*session_id);
+                                }
+                                continue;
+                            };
+
+                            match state.decoder.decode(&opus_data, &mut decode_buf, false) {
+                                Ok(decoded_samples) => {
+                                    if decoded_samples == 0 {
+                                        continue;
+                                    }
+                                    active_speakers += 1;
+                                    let mix_len = decoded_samples.min(frame_samples);
+                                    for idx in 0..mix_len {
+                                        mix_accum[idx] += decode_buf[idx] as i32;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Opus decode error for speaker {}: {}", session_id, e);
+                                }
+                            }
+                        }
+
+                        for session_id in stale_speakers {
+                            speakers.remove(&session_id);
+                        }
+
+                        if active_speakers == 0 {
+                            continue;
+                        }
+
+                        let divisor = active_speakers as i32;
+                        for idx in 0..frame_samples {
+                            let mixed = mix_accum[idx] / divisor;
+                            mixed_frame[idx] = mixed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        }
+
+                        let written = pcm_producer.push_slice(&mixed_frame);
+                        if written < frame_samples {
+                            dropped_samples += (frame_samples - written) as u64;
+                            if dropped_samples >= next_drop_log {
+                                warn!(
+                                    "Dropped {} mixed Mumble->SIP PCM samples due to full ring buffer",
+                                    dropped_samples
+                                );
+                                next_drop_log += sample_rate as u64;
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("Opus decode error: {}", e);
+                    maybe_packet = opus_rx.recv() => {
+                        let Some((session_id, opus_data)) = maybe_packet else {
+                            break;
+                        };
+
+                        let state = match speakers.entry(session_id) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let decoder = match Decoder::new(sample_rate, Channels::Mono) {
+                                    Ok(dec) => dec,
+                                    Err(e) => {
+                                        warn!("Failed to create Opus decoder for speaker {}: {}", session_id, e);
+                                        continue;
+                                    }
+                                };
+                                entry.insert(SpeakerState {
+                                    decoder,
+                                    pending_packets: VecDeque::new(),
+                                    last_packet_at: Instant::now(),
+                                    dropped_packets: 0,
+                                })
+                            }
+                        };
+
+                        if state.pending_packets.len() >= max_packets_per_speaker {
+                            state.pending_packets.pop_front();
+                            state.dropped_packets += 1;
+                            if state.dropped_packets % DROP_LOG_EVERY_FRAMES == 0 {
+                                warn!(
+                                    "Speaker {}: dropped {} queued Opus packets in jitter queue",
+                                    session_id,
+                                    state.dropped_packets
+                                );
+                            }
+                        }
+
+                        state.pending_packets.push_back(opus_data);
+                        state.last_packet_at = Instant::now();
                     }
                 }
             }
 
-            debug!("Opus decoder stopped");
+            debug!("Mixed Opus decoder stopped");
         })
     }
 }

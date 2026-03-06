@@ -59,7 +59,7 @@ accept_invalid_cert = true
 
 [audio]
 sample_rate = 48000
-frame_duration_ms = 20
+frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
 ```

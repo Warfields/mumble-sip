@@ -60,7 +60,11 @@ fn main() {
 
     for lib in &third_party_libs {
         let lib_name = format!("lib{}-{}.a", lib, target_name);
-        if pjproject_dir.join("third_party/lib").join(&lib_name).exists() {
+        if pjproject_dir
+            .join("third_party/lib")
+            .join(&lib_name)
+            .exists()
+        {
             println!("cargo:rustc-link-lib=static={}-{}", lib, target_name);
         }
     }
@@ -79,10 +83,7 @@ fn main() {
         .join(format!("libopus-{}.a", target_name))
         .exists()
     {
-        println!(
-            "cargo:rustc-link-lib=static=opus-{}",
-            target_name
-        );
+        println!("cargo:rustc-link-lib=static=opus-{}", target_name);
     } else {
         // Link system opus if pjproject didn't bundle it
         println!("cargo:rustc-link-lib=opus");
@@ -164,11 +165,7 @@ fn is_built(pjproject_dir: &Path) -> bool {
     // Look for any .a file in the lib directory
     if let Ok(entries) = std::fs::read_dir(&lib_dir) {
         for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "a")
-            {
+            if entry.path().extension().is_some_and(|ext| ext == "a") {
                 return true;
             }
         }
@@ -275,8 +272,8 @@ fn gcc_system_include_paths() -> Vec<String> {
 fn discover_target_name(pjproject_dir: &Path) -> String {
     // Parse build.mak to find the target name
     let build_mak = pjproject_dir.join("build.mak");
-    let contents =
-        std::fs::read_to_string(&build_mak).expect("Failed to read build.mak - is pjproject configured?");
+    let contents = std::fs::read_to_string(&build_mak)
+        .expect("Failed to read build.mak - is pjproject configured?");
 
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("export TARGET_NAME") {

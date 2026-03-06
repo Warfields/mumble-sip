@@ -3,11 +3,11 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use mumble_protocol_2x::Serverbound;
 use mumble_protocol_2x::control::msgs;
 use mumble_protocol_2x::control::{ClientControlCodec, ControlPacket};
 use mumble_protocol_2x::crypt::ClientCryptState;
 use mumble_protocol_2x::voice::{VoicePacket, VoicePacketPayload};
-use mumble_protocol_2x::Serverbound;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -19,7 +19,9 @@ use tracing::{debug, error, info, warn};
 /// Events emitted by the Mumble control connection.
 #[derive(Debug)]
 pub enum MumbleEvent {
-    Connected { session_id: u32 },
+    Connected {
+        session_id: u32,
+    },
     Disconnected,
     AudioReceived {
         session_id: u32,
@@ -115,11 +117,7 @@ impl MumbleClient {
                     max_channel_id = max_channel_id.max(ch_id);
                     if !config.channel.is_empty() && msg.name() == config.channel {
                         target_channel_id = Some(ch_id);
-                        debug!(
-                            "Found target channel '{}' (id={})",
-                            config.channel,
-                            ch_id
-                        );
+                        debug!("Found target channel '{}' (id={})", config.channel, ch_id);
                     }
                 }
                 ControlPacket::ServerSync(msg) => {
@@ -149,7 +147,8 @@ impl MumbleClient {
 
         // Set up event and outgoing channels
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ControlPacket<Serverbound>>();
+        let (outgoing_tx, mut outgoing_rx) =
+            mpsc::unbounded_channel::<ControlPacket<Serverbound>>();
 
         // Spawn receive loop
         let event_tx_recv = event_tx.clone();
@@ -229,11 +228,7 @@ impl MumbleClient {
                 }
             }
             ControlPacket::UserState(msg) => {
-                debug!(
-                    "User state: session={} name={}",
-                    msg.session(),
-                    msg.name()
-                );
+                debug!("User state: session={} name={}", msg.session(), msg.name());
             }
             ControlPacket::Ping(_) => {}
             _ => {}

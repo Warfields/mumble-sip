@@ -96,12 +96,30 @@ impl Config {
     }
 }
 
-fn default_sip_port() -> u16 { 5060 }
-fn default_max_calls() -> u32 { 10 }
-fn default_mumble_port() -> u16 { 64738 }
-fn default_mumble_username() -> String { "SIP-Bridge".to_string() }
-fn default_true() -> bool { true }
-fn default_sample_rate() -> u32 { 48000 }
-fn default_frame_duration() -> u32 { 20 }
-fn default_opus_bitrate() -> u32 { 64000 }
-fn default_jitter_buffer() -> u32 { 60 }
+fn default_sip_port() -> u16 {
+    5060
+}
+fn default_max_calls() -> u32 {
+    10
+}
+fn default_mumble_port() -> u16 {
+    64738
+}
+fn default_mumble_username() -> String {
+    "SIP-Bridge".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_sample_rate() -> u32 {
+    48000
+}
+fn default_frame_duration() -> u32 {
+    10
+}
+fn default_opus_bitrate() -> u32 {
+    64000
+}
+fn default_jitter_buffer() -> u32 {
+    60
+}
