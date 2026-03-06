@@ -1,0 +1,23 @@
+[workspace]
+members = [".", "pjsip-sys"]
+resolver = "3"
+
+[package]
+name = "mumble-sip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mumble-protocol-2x = "0.6.0"
+pjsip-sys = { path = "pjsip-sys" }
+tokio = { version = "1", features = ["full"] }
+tokio-openssl = "0.6"
+tokio-util = { version = "0.7", features = ["codec"] }
+openssl = "0.10"
+opus = "0.3.1"
+ringbuf = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bytes = "1"
