@@ -9,6 +9,9 @@ A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidire
 - Opus audio encoding/decoding at 48kHz
 - Lock-free audio pipeline between PJSIP and Mumble
 - Configurable max concurrent calls
+- DTMF Navigation
+  - `*` for previous channel
+  - `#` for next channel
 
 ## Dependencies
 

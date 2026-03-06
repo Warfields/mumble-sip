@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::bridge::AudioBridge;
 use crate::config::Config;
-use crate::mumble::control::{MumbleClient, MumbleEvent};
+use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
 use crate::sip::callbacks;
 use crate::sip::media_port;
@@ -39,6 +39,12 @@ struct CallSession {
     decoder_handle: JoinHandle<()>,
     voice_forward_handle: JoinHandle<()>,
     mumble_event_handle: JoinHandle<()>,
+    /// Sender handle for sending control messages to Mumble.
+    mumble_sender: MumbleSender,
+    /// Current Mumble channel ID.
+    current_channel_id: u32,
+    /// Highest channel ID on this server (from connect-time handshake).
+    max_channel_id: u32,
 }
 
 /// Deferred cleanup data for conference bridge ports.
@@ -134,8 +140,10 @@ impl SessionManager {
             }
         };
 
-        // Get a clonable sender handle for sending voice to Mumble
+        // Get a clonable sender handle for sending voice/control to Mumble
         let mumble_sender = mumble.sender();
+        let initial_channel_id = mumble.channel_id();
+        let max_channel_id = mumble.max_channel_id();
 
         // Create audio ring buffers (buffer ~200ms of audio)
         let buffer_samples = (sample_rate as usize) / 5;
@@ -160,9 +168,10 @@ impl SessionManager {
             AudioBridge::spawn_encoder(buffers.sip_to_mumble_cons, opus_encoded_tx, sample_rate, opus_bitrate);
 
         // Spawn voice forwarder: sends encoded Opus to Mumble
+        let voice_sender = mumble_sender.clone();
         let voice_forward_handle = tokio::spawn(async move {
             while let Some((seq_num, opus_data)) = opus_encoded_rx.recv().await {
-                if let Err(e) = mumble_sender.send_voice(seq_num, opus_data, false) {
+                if let Err(e) = voice_sender.send_voice(seq_num, opus_data, false) {
                     debug!("Failed to send voice to Mumble: {}", e);
                     break;
                 }
@@ -217,6 +226,9 @@ impl SessionManager {
             decoder_handle,
             voice_forward_handle,
             mumble_event_handle,
+            mumble_sender,
+            current_channel_id: initial_channel_id,
+            max_channel_id,
         };
 
         self.sessions.lock().unwrap().insert(call_id, session);
@@ -236,6 +248,31 @@ impl SessionManager {
         if let Some(session) = sessions.get_mut(&call_id) {
             session.conf_port_id = Some(conf_port_id);
             session.conf_pool = Some(SendablePool(pool));
+        }
+    }
+
+    /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
+    pub fn on_dtmf_digit(&self, call_id: pjsua_call_id, digit: char) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(&call_id) else {
+            return;
+        };
+
+        let new_channel_id = match digit {
+            '*' => session.current_channel_id.saturating_sub(1),
+            '#' => (session.current_channel_id + 1).min(session.max_channel_id),
+            _ => return,
+        };
+
+        info!(
+            "Call {}: DTMF '{}' → navigating from channel {} to {}",
+            call_id, digit, session.current_channel_id, new_channel_id
+        );
+
+        if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
+            warn!("Failed to join channel {}: {}", new_channel_id, e);
+        } else {
+            session.current_channel_id = new_channel_id;
         }
     }
 

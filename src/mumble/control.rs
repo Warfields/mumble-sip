@@ -44,6 +44,10 @@ pub struct MumbleClient {
     outgoing_tx: mpsc::UnboundedSender<ControlPacket<Serverbound>>,
     event_rx: mpsc::UnboundedReceiver<MumbleEvent>,
     session_id: u32,
+    /// Channel ID we joined at connect time (0 = root/default).
+    channel_id: u32,
+    /// Highest channel ID known at connect time.
+    max_channel_id: u32,
     recv_task: tokio::task::JoinHandle<()>,
     send_task: tokio::task::JoinHandle<()>,
 }
@@ -88,6 +92,7 @@ impl MumbleClient {
         let mut _crypt_state: Option<ClientCryptState> = None;
         let mut session_id: Option<u32> = None;
         let mut target_channel_id: Option<u32> = None;
+        let mut max_channel_id: u32 = 0;
 
         while let Some(packet) = stream.next().await {
             match packet? {
@@ -106,12 +111,14 @@ impl MumbleClient {
                     debug!("Received CryptSetup");
                 }
                 ControlPacket::ChannelState(msg) => {
+                    let ch_id = msg.channel_id();
+                    max_channel_id = max_channel_id.max(ch_id);
                     if !config.channel.is_empty() && msg.name() == config.channel {
-                        target_channel_id = Some(msg.channel_id());
+                        target_channel_id = Some(ch_id);
                         debug!(
                             "Found target channel '{}' (id={})",
                             config.channel,
-                            msg.channel_id()
+                            ch_id
                         );
                     }
                 }
@@ -192,6 +199,8 @@ impl MumbleClient {
             outgoing_tx,
             event_rx,
             session_id,
+            channel_id: target_channel_id.unwrap_or(0),
+            max_channel_id,
             recv_task,
             send_task,
         })
@@ -271,6 +280,16 @@ impl MumbleClient {
         self.session_id
     }
 
+    /// Returns the channel ID joined at connect time (0 = root/default).
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+
+    /// Returns the highest channel ID known at connect time.
+    pub fn max_channel_id(&self) -> u32 {
+        self.max_channel_id
+    }
+
     /// Get a clonable sender handle for sending voice/control from other tasks.
     pub fn sender(&self) -> MumbleSender {
         MumbleSender {
@@ -294,6 +313,14 @@ pub struct MumbleSender {
 }
 
 impl MumbleSender {
+    pub fn join_channel(&self, channel_id: u32) -> anyhow::Result<()> {
+        let mut msg = msgs::UserState::new();
+        msg.set_channel_id(channel_id);
+        self.outgoing_tx
+            .send(msg.into())
+            .map_err(|_| anyhow::anyhow!("Mumble connection closed"))
+    }
+
     pub fn send_voice(
         &self,
         seq_num: u64,

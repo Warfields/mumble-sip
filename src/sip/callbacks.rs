@@ -25,6 +25,10 @@ pub enum SipEvent {
         conf_port_id: pjsua_conf_port_id,
         pool: *mut pj_pool_t,
     },
+    DtmfDigit {
+        call_id: pjsua_call_id,
+        digit: char,
+    },
 }
 
 // Safety: SipEvent contains raw pointers only in CallMediaActive, which is
@@ -80,6 +84,7 @@ pub(super) fn get_callback_struct() -> pjsua_callback {
     cb.on_incoming_call = Some(on_incoming_call);
     cb.on_call_state = Some(on_call_state);
     cb.on_call_media_state = Some(on_call_media_state);
+    cb.on_dtmf_digit = Some(on_dtmf_digit);
     cb
 }
 
@@ -210,6 +215,13 @@ unsafe extern "C" fn on_call_state(call_id: pjsua_call_id, _e: *mut pjsip_event)
         call_id,
         state: state as u32,
     });
+}
+
+/// C callback: incoming DTMF digit (RFC 2833).
+unsafe extern "C" fn on_dtmf_digit(call_id: pjsua_call_id, digit: std::ffi::c_int) {
+    let ch = char::from_u32(digit as u32).unwrap_or('?');
+    debug!("DTMF on call {}: '{}'", call_id, ch);
+    send_event(SipEvent::DtmfDigit { call_id, digit: ch });
 }
 
 /// C callback: call media state changed.

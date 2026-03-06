@@ -62,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 session_mgr.on_call_media_active(call_id, conf_port_id, pool);
             }
+            SipEvent::DtmfDigit { call_id, digit } => {
+                session_mgr.on_dtmf_digit(call_id, digit);
+            }
         }
     }
 
