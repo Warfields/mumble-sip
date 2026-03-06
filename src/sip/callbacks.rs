@@ -235,7 +235,7 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
 
         // Create a memory pool for this port's conference bridge slot
         let pool_name = std::ffi::CString::new(format!("mumb-call{}", call_id)).unwrap();
-        let pool = pjsua_pool_create(pool_name.as_ptr(), 512, 512);
+        let pool = pjsua_pool_create(pool_name.as_ptr(), 4096, 4096);
         if pool.is_null() {
             error!("Failed to create pool for call {} media port", call_id);
             return;

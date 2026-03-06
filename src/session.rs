@@ -221,23 +221,27 @@ impl SessionManager {
         // Clean up any pending port registration that wasn't consumed
         callbacks::unregister_pending_port(call_id);
 
-        // Remove from conference bridge
+        // Remove from conference bridge — this acquires the group lock so the
+        // clock thread is not mid-callback when we proceed to destroy the port.
+        // pjsua_conf_remove_port does NOT call pjmedia_port_destroy, so the
+        // port and its user data are still valid after this call.
         if let Some(port_id) = session.conf_port_id {
             unsafe {
                 pjsua_conf_remove_port(port_id);
             }
         }
 
-        // Release the conference port pool
+        // Now safe to destroy the port — clock thread no longer references it.
+        // This frees the PortUserData and the heap-allocated pjmedia_port struct.
+        unsafe {
+            media_port::destroy_custom_port(session.media_port.0);
+        }
+
+        // Release the conference port pool.
         if let Some(SendablePool(pool)) = session.conf_pool {
             unsafe {
                 pj_pool_release(pool);
             }
-        }
-
-        // Destroy the custom media port
-        unsafe {
-            media_port::destroy_custom_port(session.media_port.0);
         }
 
         // Abort async tasks

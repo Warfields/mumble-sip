@@ -105,12 +105,19 @@ pub unsafe fn create_custom_port(
     Ok(port)
 }
 
-/// Clean up a custom port. Called automatically by pjmedia when port is removed.
+/// Clean up a custom port that was NOT added to the conference bridge
+/// (or has already been removed). If the port was in the conference bridge,
+/// `pjsua_conf_remove_port` triggers `port_on_destroy` which frees the user data,
+/// so only the port struct itself needs freeing here.
 pub unsafe fn destroy_custom_port(port: *mut pjmedia_port) {
     if !port.is_null() {
+        // Free user data only if on_destroy hasn't already done it
         let pdata = unsafe { (*port).port_data.pdata };
         if !pdata.is_null() {
-            unsafe { drop(Box::from_raw(pdata as *mut PortUserData)) };
+            unsafe {
+                drop(Box::from_raw(pdata as *mut PortUserData));
+                (*port).port_data.pdata = std::ptr::null_mut();
+            }
         }
         unsafe { drop(Box::from_raw(port)) };
     }
@@ -122,6 +129,9 @@ unsafe extern "C" fn port_put_frame(
     this_port: *mut pjmedia_port,
     frame: *mut pjmedia_frame,
 ) -> pj_status_t {
+    if this_port.is_null() || frame.is_null() {
+        return 0;
+    }
     let frame = unsafe { &*frame };
 
     // Only process audio frames
@@ -129,7 +139,11 @@ unsafe extern "C" fn port_put_frame(
         return 0;
     }
 
-    let user_data = unsafe { &mut *((*this_port).port_data.pdata as *mut PortUserData) };
+    let pdata = unsafe { (*this_port).port_data.pdata };
+    if pdata.is_null() || frame.buf.is_null() || frame.size == 0 {
+        return 0;
+    }
+    let user_data = unsafe { &mut *(pdata as *mut PortUserData) };
 
     let samples_count = frame.size / std::mem::size_of::<i16>();
     let samples =
@@ -147,8 +161,16 @@ unsafe extern "C" fn port_get_frame(
     this_port: *mut pjmedia_port,
     frame: *mut pjmedia_frame,
 ) -> pj_status_t {
+    if this_port.is_null() || frame.is_null() {
+        return 0;
+    }
     let frame = unsafe { &mut *frame };
-    let user_data = unsafe { &mut *((*this_port).port_data.pdata as *mut PortUserData) };
+    let pdata = unsafe { (*this_port).port_data.pdata };
+    if pdata.is_null() || frame.buf.is_null() || frame.size == 0 {
+        frame.type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_NONE;
+        return 0;
+    }
+    let user_data = unsafe { &mut *(pdata as *mut PortUserData) };
 
     let samples_count = frame.size / std::mem::size_of::<i16>();
     let buf = unsafe {
