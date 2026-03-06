@@ -12,6 +12,7 @@ A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidire
 - DTMF Navigation
   - `*` for previous channel
   - `#` for next channel
+- Optional Pocket-TTS channel-name announcements (managed sidecar via `uvx`)
 
 ## Dependencies
 
@@ -23,6 +24,7 @@ A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidire
 - Opus development library (`libopus-dev`)
 - UUID library (`uuid-dev`)
 - Rust / cargo
+- `uvx` (only required when `[tts].enabled = true`)
 
 ## Building
 
@@ -62,6 +64,17 @@ sample_rate = 48000
 frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
+
+[tts]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+voice = "eponine"
+announce_on_connect = true
+startup_timeout_ms = 20000
+request_timeout_ms = 3000
+announcement_debounce_ms = 750
+auto_restart = true
 ```
 
 ## Usage

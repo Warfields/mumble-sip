@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
@@ -32,6 +33,10 @@ pub enum MumbleEvent {
         session_id: u32,
         channel_id: u32,
     },
+    ChannelState {
+        channel_id: u32,
+        name: String,
+    },
     UserDisconnected {
         session_id: u32,
     },
@@ -60,6 +65,8 @@ pub struct MumbleClient {
     channel_id: u32,
     /// Highest channel ID known at connect time.
     max_channel_id: u32,
+    /// Channel names known from ChannelState messages.
+    channel_names: HashMap<u32, String>,
     recv_task: tokio::task::JoinHandle<()>,
     send_task: tokio::task::JoinHandle<()>,
 }
@@ -105,6 +112,7 @@ impl MumbleClient {
         let mut session_id: Option<u32> = None;
         let mut target_channel_id: Option<u32> = None;
         let mut max_channel_id: u32 = 0;
+        let mut channel_names: HashMap<u32, String> = HashMap::new();
 
         while let Some(packet) = stream.next().await {
             match packet? {
@@ -124,6 +132,7 @@ impl MumbleClient {
                 }
                 ControlPacket::ChannelState(msg) => {
                     let ch_id = msg.channel_id();
+                    channel_names.insert(ch_id, msg.name().to_string());
                     max_channel_id = max_channel_id.max(ch_id);
                     if !config.channel.is_empty() && msg.name() == config.channel {
                         target_channel_id = Some(ch_id);
@@ -210,6 +219,7 @@ impl MumbleClient {
             session_id,
             channel_id: target_channel_id.unwrap_or(0),
             max_channel_id,
+            channel_names,
             recv_task,
             send_task,
         })
@@ -245,6 +255,12 @@ impl MumbleClient {
                         channel_id: msg.channel_id(),
                     });
                 }
+            }
+            ControlPacket::ChannelState(msg) => {
+                let _ = event_tx.send(MumbleEvent::ChannelState {
+                    channel_id: msg.channel_id(),
+                    name: msg.name().to_string(),
+                });
             }
             ControlPacket::UserRemove(msg) => {
                 debug!("User removed: session={}", msg.session());
@@ -311,6 +327,11 @@ impl MumbleClient {
     /// Returns the highest channel ID known at connect time.
     pub fn max_channel_id(&self) -> u32 {
         self.max_channel_id
+    }
+
+    /// Returns the connect-time channel map (channel_id -> channel name).
+    pub fn channel_names(&self) -> HashMap<u32, String> {
+        self.channel_names.clone()
     }
 
     /// Get a clonable sender handle for sending voice/control from other tasks.

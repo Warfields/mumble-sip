@@ -28,9 +28,7 @@ pub fn get_sound(event: SoundEvent) -> Vec<i16> {
         SoundEvent::UserJoinedChannel => {
             USER_JOINED_PCM.get_or_init(|| decode_wav_48k(USER_JOINED_WAV))
         }
-        SoundEvent::UserLeftChannel => {
-            USER_LEFT_PCM.get_or_init(|| decode_wav_48k(USER_LEFT_WAV))
-        }
+        SoundEvent::UserLeftChannel => USER_LEFT_PCM.get_or_init(|| decode_wav_48k(USER_LEFT_WAV)),
         SoundEvent::TextMessage => {
             TEXT_MESSAGE_PCM.get_or_init(|| decode_wav_48k(TEXT_MESSAGE_WAV))
         }

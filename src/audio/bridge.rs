@@ -96,7 +96,10 @@ impl AudioBridge {
                     pcm_buf[read..].fill(0);
                 }
 
-                let avg_abs = pcm_buf.iter().map(|s| (*s as i32).abs() as f32).sum::<f32>()
+                let avg_abs = pcm_buf
+                    .iter()
+                    .map(|s| (*s as i32).abs() as f32)
+                    .sum::<f32>()
                     / frame_samples as f32;
                 let above_threshold = avg_abs >= SILENCE_AVG_ABS_THRESHOLD;
 
