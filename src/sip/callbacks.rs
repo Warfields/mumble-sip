@@ -5,6 +5,8 @@ use pjsip_sys::*;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::sip::media_port;
+
 /// Events sent from pjsua's callback thread to the tokio async world.
 #[derive(Debug)]
 pub enum SipEvent {
@@ -20,20 +22,14 @@ pub enum SipEvent {
         call_id: pjsua_call_id,
         state: u32,
     },
-    CallMediaActive {
-        call_id: pjsua_call_id,
-        conf_port_id: pjsua_conf_port_id,
-        pool: *mut pj_pool_t,
-    },
     DtmfDigit {
         call_id: pjsua_call_id,
         digit: char,
     },
 }
 
-// Safety: SipEvent contains raw pointers only in CallMediaActive, which is
-// created on pjsip's thread and consumed on tokio's main task. The pool pointer
-// is only used for cleanup (pj_pool_release) on a pj-registered thread.
+// Safety: SipEvent only carries POD/copyable values (ids/chars/u32), so it is safe
+// to send from pjsip callback threads into tokio via the channel.
 unsafe impl Send for SipEvent {}
 
 /// Global sender for bridging pjsua callbacks into tokio.
@@ -55,26 +51,88 @@ fn pending_ports() -> &'static Mutex<HashMap<pjsua_call_id, SendablePort>> {
     PENDING_PORTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone, Copy)]
+pub struct ActiveMedia {
+    pub conf_port_id: pjsua_conf_port_id,
+    pub pool: *mut pj_pool_t,
+}
+unsafe impl Send for ActiveMedia {}
+unsafe impl Sync for ActiveMedia {}
+
+/// Active media ports attached to the conference bridge, keyed by call ID.
+static ACTIVE_MEDIA: OnceLock<Mutex<HashMap<pjsua_call_id, ActiveMedia>>> = OnceLock::new();
+
+fn active_media() -> &'static Mutex<HashMap<pjsua_call_id, ActiveMedia>> {
+    ACTIVE_MEDIA.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct PendingCleanup {
+    port: *mut pjmedia_port,
+    pool: Option<*mut pj_pool_t>,
+}
+unsafe impl Send for PendingCleanup {}
+
+/// Cleanup operations waiting for conference remove-port completion.
+static PENDING_CLEANUP: OnceLock<Mutex<HashMap<pjsua_conf_port_id, PendingCleanup>>> =
+    OnceLock::new();
+
+fn pending_cleanup() -> &'static Mutex<HashMap<pjsua_conf_port_id, PendingCleanup>> {
+    PENDING_CLEANUP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Register a media port to be connected when the call's media becomes active.
 ///
 /// # Safety
 /// The `port` pointer must remain valid until it is consumed by the callback
 /// or removed via `unregister_pending_port`.
 pub fn register_pending_port(call_id: pjsua_call_id, port: *mut pjmedia_port) {
-    pending_ports().lock().unwrap().insert(call_id, SendablePort(port));
+    pending_ports()
+        .lock()
+        .unwrap()
+        .insert(call_id, SendablePort(port));
 }
 
 /// Remove a pending port registration (e.g. on call teardown before media was connected).
-pub fn unregister_pending_port(call_id: pjsua_call_id) {
-    pending_ports().lock().unwrap().remove(&call_id);
+pub fn unregister_pending_port(call_id: pjsua_call_id) -> Option<*mut pjmedia_port> {
+    pending_ports()
+        .lock()
+        .unwrap()
+        .remove(&call_id)
+        .map(|SendablePort(port)| port)
+}
+
+/// Remove and return active media metadata for a call.
+pub fn take_active_media(call_id: pjsua_call_id) -> Option<ActiveMedia> {
+    active_media().lock().unwrap().remove(&call_id)
+}
+
+/// Register media-port cleanup to run after conference REMOVE_PORT completion.
+pub fn register_pending_cleanup(
+    conf_port_id: pjsua_conf_port_id,
+    port: *mut pjmedia_port,
+    pool: Option<*mut pj_pool_t>,
+) {
+    pending_cleanup()
+        .lock()
+        .unwrap()
+        .insert(conf_port_id, PendingCleanup { port, pool });
+}
+
+/// Remove and return pending cleanup for a conference port.
+pub fn take_pending_cleanup(
+    conf_port_id: pjsua_conf_port_id,
+) -> Option<(*mut pjmedia_port, Option<*mut pj_pool_t>)> {
+    pending_cleanup()
+        .lock()
+        .unwrap()
+        .remove(&conf_port_id)
+        .map(|cleanup| (cleanup.port, cleanup.pool))
 }
 
 /// Initialize the global callback channel. Must be called before pjsua_init.
 pub(super) fn init_callbacks() -> mpsc::UnboundedReceiver<SipEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
-    EVENT_TX
-        .set(tx)
-        .expect("SIP callbacks already initialized");
+    EVENT_TX.set(tx).expect("SIP callbacks already initialized");
     rx
 }
 
@@ -84,6 +142,7 @@ pub(super) fn get_callback_struct() -> pjsua_callback {
     cb.on_incoming_call = Some(on_incoming_call);
     cb.on_call_state = Some(on_call_state);
     cb.on_call_media_state = Some(on_call_media_state);
+    cb.on_conf_op_completed = Some(on_conf_op_completed);
     cb.on_dtmf_digit = Some(on_dtmf_digit);
     cb
 }
@@ -241,7 +300,10 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
         if call_conf_port < 0 {
             warn!("Call {} has no conference port yet", call_id);
             // Put it back so we can try again on the next media state change
-            pending_ports().lock().unwrap().insert(call_id, SendablePort(port));
+            pending_ports()
+                .lock()
+                .unwrap()
+                .insert(call_id, SendablePort(port));
             return;
         }
 
@@ -250,6 +312,10 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
         let pool = pjsua_pool_create(pool_name.as_ptr(), 4096, 4096);
         if pool.is_null() {
             error!("Failed to create pool for call {} media port", call_id);
+            pending_ports()
+                .lock()
+                .unwrap()
+                .insert(call_id, SendablePort(port));
             return;
         }
 
@@ -258,6 +324,11 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
         let status = pjsua_conf_add_port(pool, port, &mut port_id);
         if status != 0 {
             error!("Failed to add media port to conference: status={}", status);
+            pj_pool_release(pool);
+            pending_ports()
+                .lock()
+                .unwrap()
+                .insert(call_id, SendablePort(port));
             return;
         }
 
@@ -276,11 +347,44 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
             call_id, port_id
         );
 
-        // Notify the session manager about the conf port ID and pool for cleanup
-        send_event(SipEvent::CallMediaActive {
+        active_media().lock().unwrap().insert(
             call_id,
-            conf_port_id: port_id,
-            pool,
-        });
+            ActiveMedia {
+                conf_port_id: port_id,
+                pool,
+            },
+        );
+    }
+}
+
+/// C callback: conference operation completion.
+unsafe extern "C" fn on_conf_op_completed(info: *const pjmedia_conf_op_info) {
+    if info.is_null() {
+        return;
+    }
+
+    let info = unsafe { &*info };
+    if info.op_type != pjmedia_conf_op_type_PJMEDIA_CONF_OP_REMOVE_PORT {
+        return;
+    }
+
+    let conf_port_id = unsafe { info.op_param.remove_port.port as pjsua_conf_port_id };
+    let Some((port, pool)) = take_pending_cleanup(conf_port_id) else {
+        return;
+    };
+
+    if info.status != 0 {
+        warn!(
+            "Conference REMOVE_PORT failed for slot {} (status={}), skipping immediate media-port cleanup",
+            conf_port_id, info.status
+        );
+        return;
+    }
+
+    unsafe {
+        media_port::destroy_custom_port(port);
+        if let Some(pool) = pool {
+            pj_pool_release(pool);
+        }
     }
 }

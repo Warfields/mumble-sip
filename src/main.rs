@@ -10,8 +10,8 @@ use tracing::{error, info};
 
 use crate::config::Config;
 use crate::session::SessionManager;
-use crate::sip::callbacks::SipEvent;
 use crate::sip::PjsuaEndpoint;
+use crate::sip::callbacks::SipEvent;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let mgr = session_mgr.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = mgr.on_incoming_call(call_id, mumble_server, caller_number).await {
+                    if let Err(e) = mgr
+                        .on_incoming_call(call_id, mumble_server, caller_number)
+                        .await
+                    {
                         error!("Failed to handle incoming call {}: {}", call_id, e);
                     }
                 });
@@ -54,13 +57,6 @@ async fn main() -> anyhow::Result<()> {
                 if state == 6 {
                     session_mgr.on_call_disconnected(call_id);
                 }
-            }
-            SipEvent::CallMediaActive {
-                call_id,
-                conf_port_id,
-                pool,
-            } => {
-                session_mgr.on_call_media_active(call_id, conf_port_id, pool);
             }
             SipEvent::DtmfDigit { call_id, digit } => {
                 session_mgr.on_dtmf_digit(call_id, digit);

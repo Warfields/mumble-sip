@@ -21,17 +21,8 @@ struct SendablePort(*mut pjmedia_port);
 unsafe impl Send for SendablePort {}
 unsafe impl Sync for SendablePort {}
 
-/// Wrapper to make raw pj_pool_t pointer Send+Sync.
-struct SendablePool(*mut pj_pool_t);
-unsafe impl Send for SendablePool {}
-unsafe impl Sync for SendablePool {}
-
 /// A single active call session, bridging one SIP call to one Mumble connection.
 struct CallSession {
-    /// Conference port ID for the custom media port.
-    conf_port_id: Option<pjsua_conf_port_id>,
-    /// Pool allocated for the conference port (must be released on teardown).
-    conf_pool: Option<SendablePool>,
     /// Raw pointer to the custom pjmedia_port (we own this memory).
     media_port: SendablePort,
     /// Task handles for cleanup.
@@ -65,7 +56,7 @@ impl DeferredCleanup {
     }
 
     fn run(self) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         sip::ensure_pj_thread_registered();
         unsafe {
             media_port::destroy_custom_port(self.port);
@@ -164,8 +155,12 @@ impl SessionManager {
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
         let (opus_encoded_tx, mut opus_encoded_rx) = mpsc::unbounded_channel::<(u64, Bytes)>();
         let opus_bitrate = self.config.audio.opus_bitrate;
-        let encoder_handle =
-            AudioBridge::spawn_encoder(buffers.sip_to_mumble_cons, opus_encoded_tx, sample_rate, opus_bitrate);
+        let encoder_handle = AudioBridge::spawn_encoder(
+            buffers.sip_to_mumble_cons,
+            opus_encoded_tx,
+            sample_rate,
+            opus_bitrate,
+        );
 
         // Spawn voice forwarder: sends encoded Opus to Mumble
         let voice_sender = mumble_sender.clone();
@@ -219,8 +214,6 @@ impl SessionManager {
 
         // Store the session
         let session = CallSession {
-            conf_port_id: None,
-            conf_pool: None,
             media_port: SendablePort(media_port),
             encoder_handle,
             decoder_handle,
@@ -235,20 +228,6 @@ impl SessionManager {
         info!("Session created for call {}", call_id);
 
         Ok(())
-    }
-
-    /// Record the conference port ID and pool assigned by the pjsip callback thread.
-    pub fn on_call_media_active(
-        &self,
-        call_id: pjsua_call_id,
-        conf_port_id: pjsua_conf_port_id,
-        pool: *mut pj_pool_t,
-    ) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(&call_id) {
-            session.conf_port_id = Some(conf_port_id);
-            session.conf_pool = Some(SendablePool(pool));
-        }
     }
 
     /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
@@ -286,8 +265,11 @@ impl SessionManager {
 
         info!("Tearing down session for call {}", call_id);
 
-        // Clean up any pending port registration that wasn't consumed
-        callbacks::unregister_pending_port(call_id);
+        // Resolve media ownership state before cleanup:
+        // - pending: port was never attached to conference
+        // - active: port is attached and must be removed asynchronously
+        let pending_port = callbacks::unregister_pending_port(call_id);
+        let active_media = callbacks::take_active_media(call_id);
 
         // Abort async tasks first — this drops the ring buffer halves owned
         // by tokio tasks, preventing further reads/writes.
@@ -296,26 +278,43 @@ impl SessionManager {
         session.voice_forward_handle.abort();
         session.mumble_event_handle.abort();
 
-        if let Some(port_id) = session.conf_port_id {
-            // Remove from conference bridge. pjsip queues the removal and
-            // processes it on the next clock tick. We must defer all cleanup
-            // until after that tick completes.
-            unsafe {
-                pjsua_conf_remove_port(port_id);
-            }
-
-            // Spawn a deferred cleanup task. The conference bridge clock runs
-            // at 20ms ticks, so waiting 100ms ensures the queued removal has
-            // been processed and pjsip no longer references our port.
-            DeferredCleanup {
-                port: session.media_port.0,
-                pool: session.conf_pool.map(|SendablePool(p)| p),
-            }.spawn_deferred();
-        } else {
-            // Port was never added to conference bridge — clean up directly.
+        if pending_port.is_some() {
+            // Port was never attached to conference bridge — clean up directly.
             unsafe {
                 media_port::destroy_custom_port(session.media_port.0);
             }
+            return;
+        }
+
+        if let Some(active_media) = active_media {
+            // Register cleanup to run exactly when REMOVE_PORT completes.
+            callbacks::register_pending_cleanup(
+                active_media.conf_port_id,
+                session.media_port.0,
+                Some(active_media.pool),
+            );
+
+            // Remove from conference bridge (asynchronous).
+            let status = unsafe { pjsua_conf_remove_port(active_media.conf_port_id) };
+            if status != 0 {
+                warn!(
+                    "Failed to remove conference port {} for call {} (status={}); using deferred fallback cleanup",
+                    active_media.conf_port_id, call_id, status
+                );
+                if let Some((port, pool)) =
+                    callbacks::take_pending_cleanup(active_media.conf_port_id)
+                {
+                    DeferredCleanup { port, pool }.spawn_deferred();
+                }
+            }
+        } else {
+            // Unknown state: callback consumed pending registration, but we didn't
+            // observe an active conference slot. Avoid immediate destroy to prevent
+            // use-after-free in pjmedia clock thread.
+            warn!(
+                "Call {} has no pending or active media state during teardown; skipping immediate media-port destroy",
+                call_id
+            );
         }
     }
 }
