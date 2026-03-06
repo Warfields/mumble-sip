@@ -15,6 +15,10 @@ pub const FRAME_DURATION_MS: u32 = 10;
 const MAX_OPUS_FRAME_SIZE: usize = 4000;
 /// How often to log dropped frames to avoid log spam.
 const DROP_LOG_EVERY_FRAMES: u64 = 100;
+/// Average absolute sample threshold for transmission gating, matching mumble-web2.
+const SILENCE_AVG_ABS_THRESHOLD: f32 = 0.001 * (i16::MAX as f32);
+/// Keep transmitting briefly after dropping below threshold.
+const SILENCE_HOLD_FRAMES_MAX: u32 = 200 / FRAME_DURATION_MS; // 200ms hold
 /// Remove idle speaker decoders after this long without packets.
 const SPEAKER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,6 +30,13 @@ pub fn frame_samples(sample_rate: u32) -> usize {
 /// 1. Encoder: reads PCM from ring buffer → encodes Opus → sends to Mumble
 /// 2. Decoder: receives Opus from Mumble → decodes to PCM → writes to ring buffer
 pub struct AudioBridge;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransmitState {
+    Transmitting,
+    Terminator,
+    Silent,
+}
 
 struct SpeakerState {
     decoder: Decoder,
@@ -41,7 +52,7 @@ impl AudioBridge {
     /// Returns a JoinHandle for the spawned task.
     pub fn spawn_encoder(
         mut pcm_consumer: ringbuf::HeapCons<i16>,
-        opus_tx: mpsc::Sender<(u64, Bytes)>,
+        opus_tx: mpsc::Sender<(u64, Bytes, bool)>,
         sample_rate: u32,
         opus_bitrate: u32,
     ) -> tokio::task::JoinHandle<()> {
@@ -63,7 +74,10 @@ impl AudioBridge {
             let mut seq_num: u64 = 0;
             let mut dropped_frames: u64 = 0;
             let mut pcm_buf = vec![0i16; frame_samples];
+            let silence_buf = vec![0i16; frame_samples];
             let mut opus_buf = vec![0u8; MAX_OPUS_FRAME_SIZE];
+            let mut was_transmitting = false;
+            let mut hold_frames = 0u32;
 
             // Poll at 5ms for low latency — encode and send as soon as a
             // full frame is available. Mumble handles jitter on its end.
@@ -82,11 +96,36 @@ impl AudioBridge {
                     pcm_buf[read..].fill(0);
                 }
 
-                // Encode to Opus
-                match encoder.encode(&pcm_buf, &mut opus_buf) {
+                let avg_abs = pcm_buf.iter().map(|s| (*s as i32).abs() as f32).sum::<f32>()
+                    / frame_samples as f32;
+                let above_threshold = avg_abs >= SILENCE_AVG_ABS_THRESHOLD;
+
+                let transmit_state = if above_threshold {
+                    hold_frames = 0;
+                    was_transmitting = true;
+                    TransmitState::Transmitting
+                } else if was_transmitting && hold_frames < SILENCE_HOLD_FRAMES_MAX {
+                    hold_frames += 1;
+                    TransmitState::Transmitting
+                } else if was_transmitting {
+                    was_transmitting = false;
+                    hold_frames = 0;
+                    TransmitState::Terminator
+                } else {
+                    TransmitState::Silent
+                };
+
+                let (frame_to_encode, end_of_transmission) = match transmit_state {
+                    TransmitState::Transmitting => (&pcm_buf[..], false),
+                    TransmitState::Terminator => (&silence_buf[..], true),
+                    TransmitState::Silent => continue,
+                };
+
+                // Encode to Opus.
+                match encoder.encode(frame_to_encode, &mut opus_buf) {
                     Ok(encoded_len) => {
                         let opus_data = Bytes::copy_from_slice(&opus_buf[..encoded_len]);
-                        match opus_tx.try_send((seq_num, opus_data)) {
+                        match opus_tx.try_send((seq_num, opus_data, end_of_transmission)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
                                 dropped_frames += 1;

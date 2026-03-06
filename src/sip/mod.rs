@@ -94,7 +94,7 @@ impl PjsuaEndpoint {
             pjsua_media_config_default(&mut media_cfg);
             media_cfg.clock_rate = 48000; // Match Mumble's Opus sample rate
             media_cfg.snd_clock_rate = 48000;
-            media_cfg.no_vad = 1; // Disable VAD — we always stream
+            media_cfg.no_vad = 1; // Disable pjsip VAD; we gate transmission in our encoder path.
 
             check_status(pjsua_init(&ua_cfg, &log_cfg, &media_cfg), "pjsua_init")?;
             debug!("pjsua initialized");
