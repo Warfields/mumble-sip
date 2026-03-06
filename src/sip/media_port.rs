@@ -52,7 +52,7 @@ struct PortUserData {
 /// The `pool` must be a valid pjsip memory pool. The returned port is allocated on the
 /// heap and must be cleaned up via `destroy_custom_port`.
 pub unsafe fn create_custom_port(
-    pool: *mut pj_pool_t,
+    _pool: *mut pj_pool_t,
     clock_rate: u32,
     samples_per_frame: u32,
     sip_to_mumble: ringbuf::HeapProd<i16>,

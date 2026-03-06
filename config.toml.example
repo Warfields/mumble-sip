@@ -1,0 +1,21 @@
+[sip]
+listen_port = 5060
+account_uri = "sip:bridge@pbx.example.com"
+registrar = "sip:pbx.example.com"
+username = "bridge"
+password = "secret"
+max_concurrent_calls = 10
+
+[mumble]
+default_host = "mumble.example.com"
+port = 64738
+username = "SIP-Bridge"
+password = ""
+channel = "SIP Calls"
+accept_invalid_cert = true
+
+[audio]
+sample_rate = 48000
+frame_duration_ms = 20
+opus_bitrate = 32000
+jitter_buffer_ms = 60

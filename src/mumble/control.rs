@@ -266,4 +266,39 @@ impl MumbleClient {
     pub fn session_id(&self) -> u32 {
         self.session_id
     }
+
+    /// Get a clonable sender handle for sending voice/control from other tasks.
+    pub fn sender(&self) -> MumbleSender {
+        MumbleSender {
+            outgoing_tx: self.outgoing_tx.clone(),
+        }
+    }
+}
+
+/// A clonable handle for sending packets to Mumble.
+/// Can be shared across tasks without owning the MumbleClient.
+#[derive(Clone)]
+pub struct MumbleSender {
+    outgoing_tx: mpsc::UnboundedSender<ControlPacket<Serverbound>>,
+}
+
+impl MumbleSender {
+    pub fn send_voice(
+        &self,
+        seq_num: u64,
+        opus_data: Bytes,
+        end_of_transmission: bool,
+    ) -> anyhow::Result<()> {
+        let voice = VoicePacket::Audio {
+            _dst: std::marker::PhantomData,
+            target: 0,
+            session_id: (),
+            seq_num,
+            payload: VoicePacketPayload::Opus(opus_data, end_of_transmission),
+            position_info: None,
+        };
+        self.outgoing_tx
+            .send(ControlPacket::UDPTunnel(Box::new(voice)))
+            .map_err(|_| anyhow::anyhow!("Mumble connection closed"))
+    }
 }

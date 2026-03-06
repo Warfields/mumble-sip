@@ -2,7 +2,6 @@ pub mod callbacks;
 pub mod media_port;
 
 use std::ffi::CString;
-use std::ptr;
 
 use pjsip_sys::*;
 use tracing::{debug, error, info};
