@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,8 +42,6 @@ struct CallSession {
     channel_watch_tx: tokio::sync::watch::Sender<u32>,
     /// Per-call sound effect sender for immediate local feedback.
     sound_tx: mpsc::UnboundedSender<Vec<i16>>,
-    /// This call's Mumble session ID, for deregistering from bridge_mumble_sessions on teardown.
-    mumble_session_id: u32,
     /// Current Mumble channel ID.
     current_channel_id: u32,
     /// Highest channel ID on this server (from connect-time handshake).
@@ -82,9 +80,6 @@ impl DeferredCleanup {
 /// Manages all active call sessions.
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
-    /// Mumble session IDs belonging to this bridge. Used to suppress audio
-    /// feedback between co-located bridge callers on the same server.
-    bridge_mumble_sessions: Arc<Mutex<HashSet<u32>>>,
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
     config: Config,
 }
@@ -93,7 +88,6 @@ impl SessionManager {
     pub fn new(config: Config, tts_runtime: Option<Arc<PocketTtsRuntime>>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            bridge_mumble_sessions: Arc::new(Mutex::new(HashSet::new())),
             tts_runtime,
             config,
         }
@@ -329,8 +323,6 @@ impl SessionManager {
         let announcement_tx_events = announcement_tx.clone();
         let text_tts_tx_events = text_tts_tx.clone();
         let our_session_id = mumble.session_id();
-        let bridge_sessions = Arc::clone(&self.bridge_mumble_sessions);
-        bridge_sessions.lock().unwrap().insert(our_session_id);
         let mut channel_names = mumble.channel_names();
         let (channel_watch_tx, mut channel_watch_rx) =
             tokio::sync::watch::channel(initial_channel_id);
@@ -352,11 +344,6 @@ impl SessionManager {
                         opus_data,
                         ..
                     } => {
-                        // Drop audio from our own session and from other bridge
-                        // callers on the same server to prevent feedback loops.
-                        if bridge_sessions.lock().unwrap().contains(&session_id) {
-                            continue;
-                        }
                         match opus_tx.try_send((session_id, opus_data)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
@@ -461,7 +448,6 @@ impl SessionManager {
             mumble_sender,
             channel_watch_tx,
             sound_tx: sound_tx.clone(),
-            mumble_session_id: our_session_id,
             current_channel_id: initial_channel_id,
             max_channel_id,
         };
@@ -514,12 +500,6 @@ impl SessionManager {
         };
 
         info!("Tearing down session for call {}", call_id);
-
-        // Deregister this call's Mumble session ID so other callers stop filtering it.
-        self.bridge_mumble_sessions
-            .lock()
-            .unwrap()
-            .remove(&session.mumble_session_id);
 
         // Resolve media ownership state before cleanup:
         // - pending: port was never attached to conference
