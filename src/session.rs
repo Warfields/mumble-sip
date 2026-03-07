@@ -35,6 +35,7 @@ struct CallSession {
     voice_forward_handle: JoinHandle<()>,
     mumble_event_handle: JoinHandle<()>,
     tts_announce_handle: JoinHandle<()>,
+    tts_text_handle: JoinHandle<()>,
     /// Sender handle for sending control messages to Mumble.
     mumble_sender: MumbleSender,
     /// Notify the event handler of channel changes from DTMF navigation.
@@ -215,6 +216,7 @@ impl SessionManager {
         let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
         let (announcement_tx, mut announcement_rx) =
             mpsc::unbounded_channel::<(u32, Option<String>)>();
+        let (text_tts_tx, mut text_tts_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
 
         // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
         let decoder_handle = AudioBridge::spawn_mixed_decoder(
@@ -295,11 +297,37 @@ impl SessionManager {
                 }
             }
         });
+        let text_tts_runtime = self.tts_runtime.clone();
+        let text_tts_sound_tx = sound_tx.clone();
+        let tts_text_handle = tokio::spawn(async move {
+            while let Some((sender_name, message)) = text_tts_rx.recv().await {
+                let phrase =
+                    crate::audio::tts::text_message_phrase(sender_name.as_deref(), &message);
+                if let Some(runtime) = text_tts_runtime.as_ref() {
+                    match runtime.synthesize_phrase(&phrase).await {
+                        Ok(pcm) => {
+                            let _ = text_tts_sound_tx.send(pcm);
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to synthesize text message phrase '{}': {}",
+                                phrase, err
+                            );
+                        }
+                    }
+                } else {
+                    warn!("TTS is enabled but runtime is unavailable for text messages");
+                }
+                let _ = text_tts_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+            }
+        });
 
         // Spawn Mumble event handler: receives audio/state events and feeds them to the decoder
         let opus_tx = opus_to_decoder_tx.clone();
         let event_sound_tx = sound_tx.clone();
         let announcement_tx_events = announcement_tx.clone();
+        let text_tts_tx_events = text_tts_tx.clone();
         let our_session_id = mumble.session_id();
         let bridge_sessions = Arc::clone(&self.bridge_mumble_sessions);
         bridge_sessions.lock().unwrap().insert(our_session_id);
@@ -376,8 +404,18 @@ impl SessionManager {
                                 event_sound_tx.send(sounds::get_sound(SoundEvent::UserLeftChannel));
                         }
                     }
-                    MumbleEvent::TextMessageReceived { .. } => {
-                        let _ = event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                    MumbleEvent::TextMessageReceived {
+                        sender_name,
+                        message,
+                    } => {
+                        if tts_enabled {
+                            if text_tts_tx_events.send((sender_name, message)).is_err() {
+                                let _ =
+                                    event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                            }
+                        } else {
+                            let _ = event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                        }
                     }
                     MumbleEvent::ChannelState { channel_id, name } => {
                         channel_names.insert(channel_id, name);
@@ -419,6 +457,7 @@ impl SessionManager {
             voice_forward_handle,
             mumble_event_handle,
             tts_announce_handle,
+            tts_text_handle,
             mumble_sender,
             channel_watch_tx,
             sound_tx: sound_tx.clone(),
@@ -495,6 +534,7 @@ impl SessionManager {
         session.voice_forward_handle.abort();
         session.mumble_event_handle.abort();
         session.tts_announce_handle.abort();
+        session.tts_text_handle.abort();
 
         if pending_port.is_some() {
             // Port was never attached to conference bridge — clean up directly.

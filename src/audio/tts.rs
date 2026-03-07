@@ -243,6 +243,336 @@ pub fn channel_announcement_phrase(channel_name: Option<&str>, channel_id: u32) 
     format!("You are now in the {} channel", name)
 }
 
+pub fn text_message_phrase(sender_name: Option<&str>, raw_message: &str) -> String {
+    let sender = sender_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Someone");
+    let analysis = analyze_text_message_for_tts(raw_message);
+    if analysis.non_link_token_count == 0 && !analysis.link_hosts_for_speech.is_empty() {
+        if analysis.link_hosts_for_speech.len() == 1 {
+            return format!(
+                "{sender} posted a link to {}",
+                analysis.link_hosts_for_speech[0]
+            );
+        }
+        return format!(
+            "{sender} posted links to {}",
+            join_human_list(&analysis.link_hosts_for_speech)
+        );
+    }
+    if analysis.normalized_message.is_empty() {
+        return format!("{sender} sent a message");
+    }
+    format!("{sender} says: {}", analysis.normalized_message)
+}
+
+struct TextMessageTtsAnalysis {
+    normalized_message: String,
+    link_hosts_for_speech: Vec<String>,
+    non_link_token_count: usize,
+}
+
+fn analyze_text_message_for_tts(raw_message: &str) -> TextMessageTtsAnalysis {
+    let with_anchor_hrefs = replace_html_anchor_tags(raw_message);
+    let without_html_tags = strip_html_tags(&with_anchor_hrefs);
+    let decoded_entities = decode_basic_html_entities(&without_html_tags);
+
+    let mut normalized_tokens = Vec::new();
+    let mut link_hosts_for_speech = Vec::new();
+    let mut non_link_token_count = 0usize;
+
+    for token in decoded_entities.split_whitespace() {
+        let (normalized_token, host_for_speech) = normalize_text_token_for_tts(token);
+        if let Some(host) = host_for_speech {
+            link_hosts_for_speech.push(host);
+        } else if token_has_spoken_content(&normalized_token) {
+            non_link_token_count += 1;
+        }
+        normalized_tokens.push(normalized_token);
+    }
+
+    TextMessageTtsAnalysis {
+        normalized_message: collapse_whitespace(&normalized_tokens.join(" ")),
+        link_hosts_for_speech,
+        non_link_token_count,
+    }
+}
+
+fn replace_html_anchor_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+
+    while cursor < input.len() {
+        let Some(anchor_start_rel) = find_ascii_case_insensitive(&input[cursor..], "<a") else {
+            out.push_str(&input[cursor..]);
+            break;
+        };
+        let anchor_start = cursor + anchor_start_rel;
+        out.push_str(&input[cursor..anchor_start]);
+
+        let Some(open_tag_end_rel) = input[anchor_start..].find('>') else {
+            out.push_str(&input[anchor_start..]);
+            break;
+        };
+        let open_tag_end = anchor_start + open_tag_end_rel;
+        let open_tag = &input[anchor_start..=open_tag_end];
+        let inner_start = open_tag_end + 1;
+
+        let Some(close_tag_rel) = find_ascii_case_insensitive(&input[inner_start..], "</a>") else {
+            out.push_str(&input[anchor_start..]);
+            break;
+        };
+        let inner_end = inner_start + close_tag_rel;
+        let close_tag_end = inner_end + "</a>".len();
+        let inner_text = &input[inner_start..inner_end];
+
+        let replacement = parse_anchor_href(open_tag).unwrap_or_else(|| inner_text.to_string());
+        out.push(' ');
+        out.push_str(&replacement);
+        out.push(' ');
+
+        cursor = close_tag_end;
+    }
+
+    out
+}
+
+fn parse_anchor_href(open_tag: &str) -> Option<String> {
+    let open_tag_lower = open_tag.to_ascii_lowercase();
+    let href_idx = open_tag_lower.find("href")?;
+    let mut value = &open_tag[href_idx + "href".len()..];
+    value = value.trim_start();
+    if !value.starts_with('=') {
+        return None;
+    }
+    value = value[1..].trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    let first_char = value.as_bytes()[0] as char;
+    if first_char == '"' || first_char == '\'' {
+        let quote = first_char;
+        let rest = &value[1..];
+        let end = rest.find(quote)?;
+        let href = &rest[..end];
+        return Some(decode_basic_html_entities(href));
+    }
+
+    let end = value
+        .char_indices()
+        .find_map(|(idx, ch)| (ch.is_whitespace() || ch == '>').then_some(idx))
+        .unwrap_or(value.len());
+    let href = &value[..end];
+    Some(decode_basic_html_entities(href))
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_basic_html_entities(input: &str) -> String {
+    input
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn token_has_spoken_content(token: &str) -> bool {
+    token.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
+fn join_human_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut out = String::new();
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    if idx == items.len() - 1 {
+                        out.push_str(", and ");
+                    } else {
+                        out.push_str(", ");
+                    }
+                }
+                out.push_str(item);
+            }
+            out
+        }
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > haystack_bytes.len() {
+        return None;
+    }
+    haystack_bytes
+        .windows(needle_bytes.len())
+        .position(|window| window.eq_ignore_ascii_case(needle_bytes))
+}
+
+fn normalize_text_token_for_tts(token: &str) -> (String, Option<String>) {
+    let (prefix, core, suffix) = split_token_affixes(token);
+    if core.is_empty() {
+        return (token.to_string(), None);
+    }
+    if let Some(hostname) = extract_url_host(core) {
+        let spoken_host = hostname_for_speech(&hostname);
+        return (format!("{prefix}{spoken_host}{suffix}"), Some(spoken_host));
+    }
+    (token.to_string(), None)
+}
+
+fn split_token_affixes(token: &str) -> (&str, &str, &str) {
+    let start = token
+        .char_indices()
+        .find(|(_, c)| !is_leading_punctuation(*c))
+        .map(|(idx, _)| idx)
+        .unwrap_or(token.len());
+    let end = token
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_trailing_punctuation(*c))
+        .map(|(idx, c)| idx + c.len_utf8())
+        .unwrap_or(start);
+    if end < start {
+        return (token, "", "");
+    }
+    (&token[..start], &token[start..end], &token[end..])
+}
+
+fn is_leading_punctuation(c: char) -> bool {
+    matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | '`')
+}
+
+fn is_trailing_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']' | '}' | '>' | '.' | ',' | '!' | '?' | ';' | ':' | '"' | '\'' | '`'
+    )
+}
+
+fn extract_url_host(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return parse_host_from_url(token);
+    }
+    if lower.starts_with("www.") {
+        let candidate = format!("https://{token}");
+        return parse_host_from_url(&candidate);
+    }
+    parse_host_from_bare_token(token)
+}
+
+fn parse_host_from_url(url: &str) -> Option<String> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("HTTP://"))
+        .or_else(|| url.strip_prefix("HTTPS://"))?;
+    let host_and_port = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = host_and_port.split(':').next().unwrap_or_default();
+    normalize_host_for_speech(host)
+}
+
+fn parse_host_from_bare_token(token: &str) -> Option<String> {
+    if token.contains("://") {
+        return None;
+    }
+    let host_and_port = token
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = host_and_port.split(':').next().unwrap_or_default();
+    normalize_host_for_speech(host)
+}
+
+fn normalize_host_for_speech(host: &str) -> Option<String> {
+    let host = host.trim().trim_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    let host = host
+        .strip_prefix("www.")
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    if !is_valid_hostname(&host) {
+        return None;
+    }
+    Some(host)
+}
+
+fn is_valid_hostname(host: &str) -> bool {
+    if !host.contains('.') {
+        return false;
+    }
+    let mut labels = host.split('.');
+    let last = match labels.next_back() {
+        Some(value) => value,
+        None => return false,
+    };
+    if !last.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    host.split('.').all(is_valid_host_label)
+}
+
+fn is_valid_host_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn hostname_for_speech(host: &str) -> String {
+    let spoken = host
+        .split('.')
+        .map(|label| label.replace('-', " dash "))
+        .collect::<Vec<_>>()
+        .join(" dot ");
+    collapse_whitespace(&spoken)
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn decode_and_resample_wav(wav_bytes: &[u8], output_sample_rate: u32) -> anyhow::Result<Vec<i16>> {
     let normalized = normalize_streamed_wav(wav_bytes);
     let mut reader =
@@ -397,6 +727,7 @@ fn linear_resample(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32>
 mod tests {
     use super::{
         CacheState, channel_announcement_phrase, decode_and_resample_wav, linear_resample,
+        text_message_phrase,
     };
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::io::Cursor;
@@ -411,6 +742,72 @@ mod tests {
     fn announcement_phrase_falls_back_to_id() {
         let phrase = channel_announcement_phrase(Some("   "), 42);
         assert_eq!(phrase, "You are now in channel 42");
+    }
+
+    #[test]
+    fn text_message_phrase_includes_sender_name() {
+        let phrase = text_message_phrase(Some("Sam"), "hello there");
+        assert_eq!(phrase, "Sam says: hello there");
+    }
+
+    #[test]
+    fn text_message_phrase_uses_default_sender_when_unknown() {
+        let phrase = text_message_phrase(None, "hello there");
+        assert_eq!(phrase, "Someone says: hello there");
+    }
+
+    #[test]
+    fn text_message_phrase_normalizes_https_url() {
+        let phrase = text_message_phrase(Some("Sam"), "check https://alamode.dev");
+        assert_eq!(phrase, "Sam says: check alamode dot dev");
+    }
+
+    #[test]
+    fn text_message_phrase_normalizes_www_url() {
+        let phrase = text_message_phrase(Some("Sam"), "check www.alamode.dev now");
+        assert_eq!(phrase, "Sam says: check alamode dot dev now");
+    }
+
+    #[test]
+    fn text_message_phrase_normalizes_bare_host_with_path_and_query() {
+        let phrase = text_message_phrase(Some("Sam"), "go to alamode.dev/black/brie?legal=yes");
+        assert_eq!(phrase, "Sam says: go to alamode dot dev");
+    }
+
+    #[test]
+    fn text_message_phrase_preserves_mixed_sentence_text() {
+        let phrase = text_message_phrase(
+            Some("Sam"),
+            "Please review this: https://alamode.dev/black/brie?even=legal thanks!",
+        );
+        assert_eq!(
+            phrase,
+            "Sam says: Please review this: alamode dot dev thanks!"
+        );
+    }
+
+    #[test]
+    fn text_message_phrase_normalizes_html_anchor_href_url() {
+        let phrase = text_message_phrase(
+            Some("Sam"),
+            r#"<a href="https://www.google.com/maps/place/Denver+Turnverein?entry=ttu&amp;g_ep=abc">https://www.google.com/maps/place/Denver+Turnverein?entry=ttu&amp;g_ep=abc</a>"#,
+        );
+        assert_eq!(phrase, "Sam posted a link to google dot com");
+    }
+
+    #[test]
+    fn text_message_phrase_uses_posted_link_wording_for_plain_link_message() {
+        let phrase = text_message_phrase(Some("Sam"), "https://www.google.com/maps/place/Denver");
+        assert_eq!(phrase, "Sam posted a link to google dot com");
+    }
+
+    #[test]
+    fn text_message_phrase_preserves_text_around_html_anchor() {
+        let phrase = text_message_phrase(
+            Some("Sam"),
+            r#"Meet at <a href="https://www.google.com/maps/place/Denver">map</a> tonight"#,
+        );
+        assert_eq!(phrase, "Sam says: Meet at google dot com tonight");
     }
 
     #[test]
