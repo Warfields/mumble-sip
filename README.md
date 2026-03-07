@@ -208,19 +208,33 @@ exten => 7001,1,NoOp(Routing to Mumble via chan_sip)
 
 ## Architecture
 
-```
-PJSIP thread(s)                        Tokio runtime
-+-----------------------+              +-----------------------------------+
-| SIP call events       |---mpsc------>| SIP event handler                 |
-| (all calls)           |              |  on IncomingCall: spawn session    |
-+-----------------------+              |  on Disconnect: tear down          |
-                                       |                                   |
-Per-call:                              |                                   |
-+-------------------+                  |                                   |
-| Call N media port |--ringbuf-------->| Session N: PCM -> Opus -> Mumble  |
-|  put_frame (PCM)  |                 | Session N: Mumble -> Opus -> PCM  |
-|  get_frame (PCM)  |<--ringbuf------+|                                   |
-+-------------------+                  +-----------------------------------+
+```mermaid
+flowchart LR
+    subgraph P["PJSIP callbacks / media threads"]
+        A["on_incoming_call / on_call_state / on_dtmf_digit"] --> B["SipEvent::*"]
+        C["on_call_media_state(call_id)"] --> D["Attach custom pjmedia_port to pjsua conference bridge"]
+        E["Call N media via custom port<br/>put_frame/get_frame (PCM)"]
+    end
+
+    B --> F["sip_events (tokio mpsc::unbounded)"]
+
+    subgraph T["Tokio runtime"]
+        F --> G["Main event loop"]
+        G -->|"IncomingCall"| H["spawn SessionManager::on_incoming_call"]
+        G -->|"CallStateChanged(disconnected)"| I["SessionManager::on_call_disconnected"]
+        G -->|"DtmfDigit"| J["SessionManager::on_dtmf_digit"]
+
+        subgraph S["Per-call Session N"]
+            H --> K["Connect to Mumble + create ring buffers/custom media port"]
+            K --> L["register_pending_port(call_id, media_port)"]
+            M["Encoder task: SIP PCM -> Opus"] --> N["Voice forwarder task -> MumbleSender.send_voice"]
+            O["Mumble event task: recv Opus/events"] --> Q["Decoder/mixer task: Opus + sounds -> SIP PCM"]
+        end
+    end
+
+    L -. consumed by .-> C
+    E --> M
+    Q --> E
 ```
 
 ### DTMF Event Handling
