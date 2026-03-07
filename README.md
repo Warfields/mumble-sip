@@ -222,3 +222,31 @@ Per-call:                              |                                   |
 |  get_frame (PCM)  |<--ringbuf------+|                                   |
 +-------------------+                  +-----------------------------------+
 ```
+
+### DTMF Event Handling
+
+```mermaid
+flowchart LR
+    subgraph P["PJSIP callback thread"]
+        A["RFC 2833 DTMF digit"] --> B["on_dtmf_digit(call_id, digit)"]
+        B --> C["SipEvent::DtmfDigit { call_id, digit }"]
+    end
+
+    C --> D["sip_events (mpsc)"]
+
+    subgraph T["Tokio runtime"]
+        D --> E["main event loop recv()"]
+        E --> F["SessionManager::on_dtmf_digit(call_id, digit)"]
+        F --> G{"digit"}
+        G -- "*" --> H["target = current_channel_id - 1"]
+        G -- "#" --> I["target = min(current + 1, max_channel_id)"]
+        G -- "other" --> J["ignore"]
+
+        H --> K["play navigation sound"]
+        I --> K
+        K --> L["mumble_sender.join_channel(target)"]
+        L -- "success" --> M["update current_channel_id"]
+        M --> N["channel_watch_tx.send(target)"]
+        L -- "error" --> O["log warning (session state unchanged)"]
+    end
+```
