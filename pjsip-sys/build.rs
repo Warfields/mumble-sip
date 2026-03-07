@@ -123,6 +123,14 @@ fn main() {
         .clang_arg("-xc")
         .clang_args(gcc_system_include_paths());
 
+    if let Ok(target) = env::var("TARGET") {
+        builder = builder.clang_arg(format!("--target={target}"));
+    }
+
+    for define in pj_build_defines(&pjproject_dir) {
+        builder = builder.clang_arg(define);
+    }
+
     for dir in &include_dirs {
         builder = builder.clang_arg(format!("-I{}", dir.display()));
     }
@@ -288,4 +296,41 @@ fn discover_target_name(pjproject_dir: &Path) -> String {
     }
 
     panic!("Could not find TARGET_NAME in build.mak");
+}
+
+fn pj_build_defines(pjproject_dir: &Path) -> Vec<String> {
+    let build_mak = pjproject_dir.join("build.mak");
+    let contents = match std::fs::read_to_string(&build_mak) {
+        Ok(contents) => contents,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut cflags = String::new();
+    let mut collecting = false;
+
+    for line in contents.lines() {
+        if !collecting {
+            if let Some((_, rest)) = line.split_once("export APP_CFLAGS :=") {
+                collecting = true;
+                cflags.push_str(rest.trim().trim_end_matches('\\'));
+                cflags.push(' ');
+                if !line.trim_end().ends_with('\\') {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        cflags.push_str(line.trim().trim_end_matches('\\'));
+        cflags.push(' ');
+        if !line.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+
+    cflags
+        .split_whitespace()
+        .filter(|token| token.starts_with("-D"))
+        .map(str::to_owned)
+        .collect()
 }
