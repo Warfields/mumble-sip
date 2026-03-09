@@ -12,6 +12,7 @@ A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidire
 - DTMF Navigation
   - `*` for previous channel
   - `#` for next channel
+- Optional Pocket-TTS channel-name announcements (managed sidecar via `uvx`)
 
 ## Dependencies
 
@@ -23,6 +24,7 @@ A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidire
 - Opus development library (`libopus-dev`)
 - UUID library (`uuid-dev`)
 - Rust / cargo
+- `uvx` (only required when `[tts].enabled = true`)
 
 ## Building
 
@@ -62,6 +64,17 @@ sample_rate = 48000
 frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
+
+[tts]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+voice = "eponine"
+announce_on_connect = true
+startup_timeout_ms = 20000
+request_timeout_ms = 3000
+announcement_debounce_ms = 750
+auto_restart = true
 ```
 
 ## Usage
@@ -195,17 +208,59 @@ exten => 7001,1,NoOp(Routing to Mumble via chan_sip)
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph P["PJSIP callbacks / media threads"]
+        A["on_incoming_call / on_call_state / on_dtmf_digit"] --> B["SipEvent::*"]
+        C["on_call_media_state(call_id)"] --> D["Attach custom pjmedia_port to pjsua conference bridge"]
+        E["Call N media via custom port<br/>put_frame/get_frame (PCM)"]
+    end
+
+    B --> F["sip_events (tokio mpsc::unbounded)"]
+
+    subgraph T["Tokio runtime"]
+        F --> G["Main event loop"]
+        G -->|"IncomingCall"| H["spawn SessionManager::on_incoming_call"]
+        G -->|"CallStateChanged(disconnected)"| I["SessionManager::on_call_disconnected"]
+        G -->|"DtmfDigit"| J["SessionManager::on_dtmf_digit"]
+
+        subgraph S["Per-call Session N"]
+            H --> K["Connect to Mumble + create ring buffers/custom media port"]
+            K --> L["register_pending_port(call_id, media_port)"]
+            M["Encoder task: SIP PCM -> Opus"] --> N["Voice forwarder task -> MumbleSender.send_voice"]
+            O["Mumble event task: recv Opus/events"] --> Q["Decoder/mixer task: Opus + sounds -> SIP PCM"]
+        end
+    end
+
+    L -. consumed by .-> C
+    E --> M
+    Q --> E
 ```
-PJSIP thread(s)                        Tokio runtime
-+-----------------------+              +-----------------------------------+
-| SIP call events       |---mpsc------>| SIP event handler                 |
-| (all calls)           |              |  on IncomingCall: spawn session    |
-+-----------------------+              |  on Disconnect: tear down          |
-                                       |                                   |
-Per-call:                              |                                   |
-+-------------------+                  |                                   |
-| Call N media port |--ringbuf-------->| Session N: PCM -> Opus -> Mumble  |
-|  put_frame (PCM)  |                 | Session N: Mumble -> Opus -> PCM  |
-|  get_frame (PCM)  |<--ringbuf------+|                                   |
-+-------------------+                  +-----------------------------------+
+
+### DTMF Event Handling
+
+```mermaid
+flowchart LR
+    subgraph P["PJSIP callback thread"]
+        A["RFC 2833 DTMF digit"] --> B["on_dtmf_digit(call_id, digit)"]
+        B --> C["SipEvent::DtmfDigit { call_id, digit }"]
+    end
+
+    C --> D["sip_events (mpsc)"]
+
+    subgraph T["Tokio runtime"]
+        D --> E["main event loop recv()"]
+        E --> F["SessionManager::on_dtmf_digit(call_id, digit)"]
+        F --> G{"digit"}
+        G -- "*" --> H["target = current_channel_id - 1"]
+        G -- "#" --> I["target = min(current + 1, max_channel_id)"]
+        G -- "other" --> J["ignore"]
+
+        H --> K["play navigation sound"]
+        I --> K
+        K --> L["mumble_sender.join_channel(target)"]
+        L -- "success" --> M["update current_channel_id"]
+        M --> N["channel_watch_tx.send(target)"]
+        L -- "error" --> O["log warning (session state unchanged)"]
+    end
 ```

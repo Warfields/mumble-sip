@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Opus frame duration in milliseconds.
 /// Mumble uses 10ms frames (iFrameSize = SAMPLE_RATE / 100 = 480).
@@ -13,8 +13,14 @@ pub const FRAME_DURATION_MS: u32 = 10;
 
 /// Maximum encoded Opus frame size in bytes.
 const MAX_OPUS_FRAME_SIZE: usize = 4000;
+/// Maximum Opus packet duration is 120ms; size decode buffers accordingly.
+const MAX_OPUS_FRAME_DURATION_MS: usize = 120;
 /// How often to log dropped frames to avoid log spam.
 const DROP_LOG_EVERY_FRAMES: u64 = 100;
+/// Average absolute sample threshold for transmission gating, matching mumble-web2.
+const SILENCE_AVG_ABS_THRESHOLD: f32 = 0.001 * (i16::MAX as f32);
+/// Keep transmitting briefly after dropping below threshold.
+const SILENCE_HOLD_FRAMES_MAX: u32 = 200 / FRAME_DURATION_MS; // 200ms hold
 /// Remove idle speaker decoders after this long without packets.
 const SPEAKER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -27,9 +33,17 @@ pub fn frame_samples(sample_rate: u32) -> usize {
 /// 2. Decoder: receives Opus from Mumble → decodes to PCM → writes to ring buffer
 pub struct AudioBridge;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransmitState {
+    Transmitting,
+    Terminator,
+    Silent,
+}
+
 struct SpeakerState {
     decoder: Decoder,
     pending_packets: VecDeque<Bytes>,
+    pending_pcm: VecDeque<i16>,
     last_packet_at: Instant,
     dropped_packets: u64,
 }
@@ -41,7 +55,7 @@ impl AudioBridge {
     /// Returns a JoinHandle for the spawned task.
     pub fn spawn_encoder(
         mut pcm_consumer: ringbuf::HeapCons<i16>,
-        opus_tx: mpsc::Sender<(u64, Bytes)>,
+        opus_tx: mpsc::Sender<(u64, Bytes, bool)>,
         sample_rate: u32,
         opus_bitrate: u32,
     ) -> tokio::task::JoinHandle<()> {
@@ -63,7 +77,10 @@ impl AudioBridge {
             let mut seq_num: u64 = 0;
             let mut dropped_frames: u64 = 0;
             let mut pcm_buf = vec![0i16; frame_samples];
+            let silence_buf = vec![0i16; frame_samples];
             let mut opus_buf = vec![0u8; MAX_OPUS_FRAME_SIZE];
+            let mut was_transmitting = false;
+            let mut hold_frames = 0u32;
 
             // Poll at 5ms for low latency — encode and send as soon as a
             // full frame is available. Mumble handles jitter on its end.
@@ -82,11 +99,39 @@ impl AudioBridge {
                     pcm_buf[read..].fill(0);
                 }
 
-                // Encode to Opus
-                match encoder.encode(&pcm_buf, &mut opus_buf) {
+                let avg_abs = pcm_buf
+                    .iter()
+                    .map(|s| (*s as i32).abs() as f32)
+                    .sum::<f32>()
+                    / frame_samples as f32;
+                let above_threshold = avg_abs >= SILENCE_AVG_ABS_THRESHOLD;
+
+                let transmit_state = if above_threshold {
+                    hold_frames = 0;
+                    was_transmitting = true;
+                    TransmitState::Transmitting
+                } else if was_transmitting && hold_frames < SILENCE_HOLD_FRAMES_MAX {
+                    hold_frames += 1;
+                    TransmitState::Transmitting
+                } else if was_transmitting {
+                    was_transmitting = false;
+                    hold_frames = 0;
+                    TransmitState::Terminator
+                } else {
+                    TransmitState::Silent
+                };
+
+                let (frame_to_encode, end_of_transmission) = match transmit_state {
+                    TransmitState::Transmitting => (&pcm_buf[..], false),
+                    TransmitState::Terminator => (&silence_buf[..], true),
+                    TransmitState::Silent => continue,
+                };
+
+                // Encode to Opus.
+                match encoder.encode(frame_to_encode, &mut opus_buf) {
                     Ok(encoded_len) => {
                         let opus_data = Bytes::copy_from_slice(&opus_buf[..encoded_len]);
-                        match opus_tx.try_send((seq_num, opus_data)) {
+                        match opus_tx.try_send((seq_num, opus_data, end_of_transmission)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
                                 dropped_frames += 1;
@@ -117,9 +162,11 @@ impl AudioBridge {
     /// Spawn a mixed decoder task:
     /// - decodes each speaker using its own Opus decoder state
     /// - mixes active speakers into one 10ms PCM frame
+    /// - mixes in queued sound effects (join/leave chimes, etc.)
     /// - outputs exactly one mixed frame per tick to match realtime playout
     pub fn spawn_mixed_decoder(
         mut opus_rx: mpsc::Receiver<(u32, Bytes)>,
+        mut sound_rx: mpsc::UnboundedReceiver<Vec<i16>>,
         mut pcm_producer: ringbuf::HeapProd<i16>,
         sample_rate: u32,
         jitter_frames: usize,
@@ -129,10 +176,14 @@ impl AudioBridge {
             let mut speakers: HashMap<u32, SpeakerState> = HashMap::new();
             let mut mix_accum = vec![0i32; frame_samples];
             let mut mixed_frame = vec![0i16; frame_samples];
-            let mut decode_buf = vec![0i16; frame_samples];
+            let max_decode_samples =
+                ((sample_rate as usize) * MAX_OPUS_FRAME_DURATION_MS / 1000).max(frame_samples);
+            let mut decode_buf = vec![0i16; max_decode_samples];
             let max_packets_per_speaker = (jitter_frames * 2).max(4);
             let mut dropped_samples: u64 = 0;
             let mut next_drop_log: u64 = sample_rate as u64; // ~1s of audio.
+            let mut sound_queue: VecDeque<i16> = VecDeque::new();
+            let mut sound_closed = false;
             let mut interval =
                 tokio::time::interval(Duration::from_millis(FRAME_DURATION_MS as u64));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -147,26 +198,38 @@ impl AudioBridge {
                         let mut stale_speakers = Vec::new();
 
                         for (session_id, state) in speakers.iter_mut() {
-                            let Some(opus_data) = state.pending_packets.pop_front() else {
-                                if now.duration_since(state.last_packet_at) > SPEAKER_IDLE_TIMEOUT {
+                            while state.pending_pcm.len() < frame_samples {
+                                let Some(opus_data) = state.pending_packets.pop_front() else {
+                                    break;
+                                };
+                                match state.decoder.decode(&opus_data, &mut decode_buf, false) {
+                                    Ok(decoded_samples) => {
+                                        if decoded_samples == 0 {
+                                            continue;
+                                        }
+                                        state.pending_pcm.extend(&decode_buf[..decoded_samples]);
+                                    }
+                                    Err(e) => {
+                                        warn!("Opus decode error for speaker {}: {}", session_id, e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if state.pending_pcm.is_empty() {
+                                if state.pending_packets.is_empty()
+                                    && now.duration_since(state.last_packet_at) > SPEAKER_IDLE_TIMEOUT
+                                {
                                     stale_speakers.push(*session_id);
                                 }
                                 continue;
-                            };
+                            }
 
-                            match state.decoder.decode(&opus_data, &mut decode_buf, false) {
-                                Ok(decoded_samples) => {
-                                    if decoded_samples == 0 {
-                                        continue;
-                                    }
-                                    active_speakers += 1;
-                                    let mix_len = decoded_samples.min(frame_samples);
-                                    for idx in 0..mix_len {
-                                        mix_accum[idx] += decode_buf[idx] as i32;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Opus decode error for speaker {}: {}", session_id, e);
+                            active_speakers += 1;
+                            let mix_len = frame_samples.min(state.pending_pcm.len());
+                            for idx in 0..mix_len {
+                                if let Some(sample) = state.pending_pcm.pop_front() {
+                                    mix_accum[idx] += sample as i32;
                                 }
                             }
                         }
@@ -175,14 +238,22 @@ impl AudioBridge {
                             speakers.remove(&session_id);
                         }
 
-                        if active_speakers == 0 {
+                        // Mix in queued sound effect samples
+                        let has_sound = !sound_queue.is_empty();
+                        if has_sound {
+                            let drain_count = frame_samples.min(sound_queue.len());
+                            for sample in mix_accum.iter_mut().take(drain_count) {
+                                *sample += sound_queue.pop_front().unwrap() as i32;
+                            }
+                        }
+
+                        let active_sources = active_speakers + if has_sound { 1 } else { 0 };
+                        if active_sources == 0 {
                             continue;
                         }
 
-                        let divisor = active_speakers as i32;
                         for idx in 0..frame_samples {
-                            let mixed = mix_accum[idx] / divisor;
-                            mixed_frame[idx] = mixed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            mixed_frame[idx] = mix_accum[idx].clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         }
 
                         let written = pcm_producer.push_slice(&mixed_frame);
@@ -215,6 +286,7 @@ impl AudioBridge {
                                 entry.insert(SpeakerState {
                                     decoder,
                                     pending_packets: VecDeque::new(),
+                                    pending_pcm: VecDeque::new(),
                                     last_packet_at: Instant::now(),
                                     dropped_packets: 0,
                                 })
@@ -235,6 +307,17 @@ impl AudioBridge {
 
                         state.pending_packets.push_back(opus_data);
                         state.last_packet_at = Instant::now();
+                    }
+                    maybe_sound = sound_rx.recv(), if !sound_closed => {
+                        match maybe_sound {
+                            Some(pcm) => {
+                                trace!("Queued sound effect ({} samples)", pcm.len());
+                                sound_queue.extend(pcm);
+                            }
+                            None => {
+                                sound_closed = true;
+                            }
+                        }
                     }
                 }
             }

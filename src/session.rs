@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use pjsip_sys::*;
@@ -9,6 +10,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::bridge::AudioBridge;
+use crate::audio::sounds::{self, SoundEvent};
+use crate::audio::tts::PocketTtsRuntime;
 use crate::config::Config;
 use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
@@ -31,8 +34,14 @@ struct CallSession {
     decoder_handle: JoinHandle<()>,
     voice_forward_handle: JoinHandle<()>,
     mumble_event_handle: JoinHandle<()>,
+    tts_announce_handle: JoinHandle<()>,
+    tts_text_handle: JoinHandle<()>,
     /// Sender handle for sending control messages to Mumble.
     mumble_sender: MumbleSender,
+    /// Notify the event handler of channel changes from DTMF navigation.
+    channel_watch_tx: tokio::sync::watch::Sender<u32>,
+    /// Per-call sound effect sender for immediate local feedback.
+    sound_tx: mpsc::UnboundedSender<Vec<i16>>,
     /// Current Mumble channel ID.
     current_channel_id: u32,
     /// Highest channel ID on this server (from connect-time handshake).
@@ -71,13 +80,15 @@ impl DeferredCleanup {
 /// Manages all active call sessions.
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
+    tts_runtime: Option<Arc<PocketTtsRuntime>>,
     config: Config,
 }
 
 impl SessionManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, tts_runtime: Option<Arc<PocketTtsRuntime>>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            tts_runtime,
             config,
         }
     }
@@ -123,7 +134,9 @@ impl SessionManager {
         let jitter_frames = (self.config.audio.jitter_buffer_ms
             / crate::audio::bridge::FRAME_DURATION_MS)
             .max(2) as usize;
-        let queue_capacity = (jitter_frames * 2).max(8);
+        // Scale the opus→decoder channel by max_concurrent_calls to accommodate
+        // bursts from multiple simultaneous Mumble speakers on a busy server.
+        let queue_capacity = jitter_frames * self.config.sip.max_concurrent_calls as usize;
 
         info!(
             "Setting up session for call {} -> Mumble {}:{}",
@@ -148,6 +161,7 @@ impl SessionManager {
         let mumble_sender = mumble.sender();
         let initial_channel_id = mumble.channel_id();
         let max_channel_id = mumble.max_channel_id();
+        let initial_channel_name = mumble.channel_names().get(&initial_channel_id).cloned();
 
         // Create audio ring buffers (buffer ~200ms of audio)
         let buffer_samples = (sample_rate as usize) / 5;
@@ -166,7 +180,8 @@ impl SessionManager {
         };
 
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
-        let (opus_encoded_tx, mut opus_encoded_rx) = mpsc::channel::<(u64, Bytes)>(queue_capacity);
+        let (opus_encoded_tx, mut opus_encoded_rx) =
+            mpsc::channel::<(u64, Bytes, bool)>(queue_capacity);
         let opus_bitrate = self.config.audio.opus_bitrate;
         let encoder_handle = AudioBridge::spawn_encoder(
             buffers.sip_to_mumble_cons,
@@ -178,8 +193,9 @@ impl SessionManager {
         // Spawn voice forwarder: sends encoded Opus to Mumble
         let voice_sender = mumble_sender.clone();
         let voice_forward_handle = tokio::spawn(async move {
-            while let Some((seq_num, opus_data)) = opus_encoded_rx.recv().await {
-                if let Err(e) = voice_sender.send_voice(seq_num, opus_data, false) {
+            while let Some((seq_num, opus_data, end_of_transmission)) = opus_encoded_rx.recv().await
+            {
+                if let Err(e) = voice_sender.send_voice(seq_num, opus_data, end_of_transmission) {
                     debug!("Failed to send voice to Mumble: {}", e);
                     break;
                 }
@@ -190,37 +206,207 @@ impl SessionManager {
         let (opus_to_decoder_tx, opus_to_decoder_rx) =
             mpsc::channel::<(u32, Bytes)>(queue_capacity);
 
+        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
+        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+        let (announcement_tx, mut announcement_rx) =
+            mpsc::unbounded_channel::<(u32, Option<String>)>();
+        let (text_tts_tx, mut text_tts_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
+
         // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
         let decoder_handle = AudioBridge::spawn_mixed_decoder(
             opus_to_decoder_rx,
+            sound_rx,
             buffers.mumble_to_sip_prod,
             sample_rate,
             jitter_frames,
         );
 
-        // Spawn Mumble event handler: receives audio events and feeds them to the decoder
+        let tts_enabled = self.config.tts.enabled;
+        let announce_on_connect = self.config.tts.announce_on_connect;
+        let announce_debounce = if tts_enabled {
+            Duration::from_millis(self.config.tts.announcement_debounce_ms)
+        } else {
+            Duration::from_millis(0)
+        };
+        let tts_runtime = self.tts_runtime.clone();
+        let tts_sound_tx = sound_tx.clone();
+        let tts_announce_handle = tokio::spawn(async move {
+            let mut last_announced_channel: Option<u32> = None;
+
+            while let Some(first_announcement) = announcement_rx.recv().await {
+                // Debounce rapid channel moves so we only announce the final room.
+                let mut latest = first_announcement;
+                let mut rx_closed = false;
+                if !announce_debounce.is_zero() {
+                    loop {
+                        match tokio::time::timeout(announce_debounce, announcement_rx.recv()).await
+                        {
+                            // New channel-change arrived before timeout: update and
+                            // restart debounce window from now.
+                            Ok(Some(next)) => {
+                                latest = next;
+                            }
+                            // Announcement channel closed: finish current pending item
+                            // and then exit worker.
+                            Ok(None) => {
+                                rx_closed = true;
+                                break;
+                            }
+                            // Quiet period reached: proceed with latest announcement.
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                let (channel_id, channel_name) = latest;
+                if last_announced_channel == Some(channel_id) {
+                    continue;
+                }
+                last_announced_channel = Some(channel_id);
+
+                if tts_enabled {
+                    if let Some(runtime) = tts_runtime.as_ref() {
+                        match runtime
+                            .synth_channel_announcement(channel_name.as_deref(), channel_id)
+                            .await
+                        {
+                            Ok(pcm) => {
+                                let _ = tts_sound_tx.send(pcm);
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to synthesize channel announcement for channel {}: {}",
+                                    channel_id, err
+                                );
+                            }
+                        }
+                    } else {
+                        warn!("TTS is enabled but runtime is unavailable");
+                    }
+                }
+
+                if rx_closed {
+                    break;
+                }
+            }
+        });
+        let text_tts_runtime = self.tts_runtime.clone();
+        let text_tts_sound_tx = sound_tx.clone();
+        let tts_text_handle = tokio::spawn(async move {
+            while let Some((sender_name, message)) = text_tts_rx.recv().await {
+                let phrase =
+                    crate::audio::tts::text_message_phrase(sender_name.as_deref(), &message);
+                if let Some(runtime) = text_tts_runtime.as_ref() {
+                    match runtime.synthesize_phrase(&phrase).await {
+                        Ok(pcm) => {
+                            let _ = text_tts_sound_tx.send(pcm);
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to synthesize text message phrase '{}': {}",
+                                phrase, err
+                            );
+                        }
+                    }
+                } else {
+                    warn!("TTS is enabled but runtime is unavailable for text messages");
+                }
+                let _ = text_tts_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+            }
+        });
+
+        // Spawn Mumble event handler: receives audio/state events and feeds them to the decoder
         let opus_tx = opus_to_decoder_tx.clone();
+        let event_sound_tx = sound_tx.clone();
+        let announcement_tx_events = announcement_tx.clone();
+        let text_tts_tx_events = text_tts_tx.clone();
+        let our_session_id = mumble.session_id();
+        let mut channel_names = mumble.channel_names();
+        let (channel_watch_tx, mut channel_watch_rx) =
+            tokio::sync::watch::channel(initial_channel_id);
         let mumble_event_handle = tokio::spawn(async move {
             let mut dropped_decoder_frames: u64 = 0;
+            // Track which channel each user is in so we can detect join/leave.
+            let mut user_channels: HashMap<u32, u32> = HashMap::new();
+            let mut our_channel_id = initial_channel_id;
+
             while let Some(event) = mumble.recv_event().await {
+                // Check for channel updates from DTMF navigation
+                if channel_watch_rx.has_changed().unwrap_or(false) {
+                    our_channel_id = *channel_watch_rx.borrow_and_update();
+                }
+
                 match event {
                     MumbleEvent::AudioReceived {
                         session_id,
                         opus_data,
                         ..
-                    } => match opus_tx.try_send((session_id, opus_data)) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            dropped_decoder_frames += 1;
-                            if dropped_decoder_frames % 100 == 0 {
-                                warn!(
-                                    "Call {}: dropped {} Mumble Opus frames before mixer due to full queue",
-                                    call_id, dropped_decoder_frames
-                                );
+                    } => {
+                        match opus_tx.try_send((session_id, opus_data)) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                dropped_decoder_frames += 1;
+                                if dropped_decoder_frames % 100 == 0 {
+                                    warn!(
+                                        "Call {}: dropped {} Mumble Opus frames before mixer due to full queue",
+                                        call_id, dropped_decoder_frames
+                                    );
+                                }
                             }
+                            Err(TrySendError::Closed(_)) => break,
                         }
-                        Err(TrySendError::Closed(_)) => break,
-                    },
+                    }
+                    MumbleEvent::UserChangedChannel {
+                        session_id,
+                        channel_id,
+                    } => {
+                        let old_channel = user_channels.insert(session_id, channel_id);
+
+                        if session_id == our_session_id {
+                            // We changed channel (server confirmed).
+                            // Use the previously confirmed self-channel from user_channels
+                            // so DTMF watch updates do not suppress announcements.
+                            if tts_enabled && old_channel != Some(channel_id) {
+                                let channel_name = channel_names.get(&channel_id).cloned();
+                                let _ = announcement_tx_events.send((channel_id, channel_name));
+                            }
+                            our_channel_id = channel_id;
+                        } else if channel_id == our_channel_id {
+                            // Someone joined our channel
+                            let _ = event_sound_tx
+                                .send(sounds::get_sound(SoundEvent::UserJoinedChannel));
+                        } else if old_channel == Some(our_channel_id) {
+                            // Someone left our channel
+                            let _ =
+                                event_sound_tx.send(sounds::get_sound(SoundEvent::UserLeftChannel));
+                        }
+                    }
+                    MumbleEvent::UserDisconnected { session_id } => {
+                        if let Some(ch) = user_channels.remove(&session_id)
+                            && ch == our_channel_id
+                        {
+                            let _ =
+                                event_sound_tx.send(sounds::get_sound(SoundEvent::UserLeftChannel));
+                        }
+                    }
+                    MumbleEvent::TextMessageReceived {
+                        sender_name,
+                        message,
+                    } => {
+                        if tts_enabled {
+                            if text_tts_tx_events.send((sender_name, message)).is_err() {
+                                let _ =
+                                    event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                            }
+                        } else {
+                            let _ = event_sound_tx.send(sounds::get_sound(SoundEvent::TextMessage));
+                        }
+                    }
+                    MumbleEvent::ChannelState { channel_id, name } => {
+                        channel_names.insert(channel_id, name);
+                    }
                     MumbleEvent::Disconnected => {
                         info!("Mumble disconnected for call event loop");
                         break;
@@ -243,6 +429,13 @@ impl SessionManager {
             }
         }
 
+        // Initial connect announcement behavior.
+        if tts_enabled && announce_on_connect {
+            let _ = announcement_tx.send((initial_channel_id, initial_channel_name));
+        } else {
+            let _ = sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+        }
+
         // Store the session
         let session = CallSession {
             media_port: SendablePort(media_port),
@@ -250,7 +443,11 @@ impl SessionManager {
             decoder_handle,
             voice_forward_handle,
             mumble_event_handle,
+            tts_announce_handle,
+            tts_text_handle,
             mumble_sender,
+            channel_watch_tx,
+            sound_tx: sound_tx.clone(),
             current_channel_id: initial_channel_id,
             max_channel_id,
         };
@@ -279,10 +476,18 @@ impl SessionManager {
             call_id, digit, session.current_channel_id, new_channel_id
         );
 
+        // Always provide immediate audible feedback for DTMF navigation.
+        let _ = session
+            .sound_tx
+            .send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+
         if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
             warn!("Failed to join channel {}: {}", new_channel_id, e);
         } else {
             session.current_channel_id = new_channel_id;
+            // Notify the event handler of the new channel so it can correctly
+            // attribute join/leave events.
+            let _ = session.channel_watch_tx.send(new_channel_id);
         }
     }
 
@@ -308,6 +513,8 @@ impl SessionManager {
         session.decoder_handle.abort();
         session.voice_forward_handle.abort();
         session.mumble_event_handle.abort();
+        session.tts_announce_handle.abort();
+        session.tts_text_handle.abort();
 
         if pending_port.is_some() {
             // Port was never attached to conference bridge — clean up directly.

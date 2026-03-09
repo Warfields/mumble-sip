@@ -19,3 +19,14 @@ sample_rate = 48000
 frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
+
+[tts]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+voice = "eponine"
+announce_on_connect = true
+startup_timeout_ms = 20000
+request_timeout_ms = 3000
+announcement_debounce_ms = 200
+auto_restart = true

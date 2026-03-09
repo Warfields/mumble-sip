@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
@@ -28,6 +29,21 @@ pub enum MumbleEvent {
         opus_data: Bytes,
         seq_num: u64,
     },
+    UserChangedChannel {
+        session_id: u32,
+        channel_id: u32,
+    },
+    ChannelState {
+        channel_id: u32,
+        name: String,
+    },
+    UserDisconnected {
+        session_id: u32,
+    },
+    TextMessageReceived {
+        sender_name: Option<String>,
+        message: String,
+    },
 }
 
 /// Configuration for connecting to a Mumble server.
@@ -50,6 +66,8 @@ pub struct MumbleClient {
     channel_id: u32,
     /// Highest channel ID known at connect time.
     max_channel_id: u32,
+    /// Channel names known from ChannelState messages.
+    channel_names: HashMap<u32, String>,
     recv_task: tokio::task::JoinHandle<()>,
     send_task: tokio::task::JoinHandle<()>,
 }
@@ -95,6 +113,8 @@ impl MumbleClient {
         let mut session_id: Option<u32> = None;
         let mut target_channel_id: Option<u32> = None;
         let mut max_channel_id: u32 = 0;
+        let mut channel_names: HashMap<u32, String> = HashMap::new();
+        let mut user_names: HashMap<u32, String> = HashMap::new();
 
         while let Some(packet) = stream.next().await {
             match packet? {
@@ -114,11 +134,15 @@ impl MumbleClient {
                 }
                 ControlPacket::ChannelState(msg) => {
                     let ch_id = msg.channel_id();
+                    channel_names.insert(ch_id, msg.name().to_string());
                     max_channel_id = max_channel_id.max(ch_id);
                     if !config.channel.is_empty() && msg.name() == config.channel {
                         target_channel_id = Some(ch_id);
                         debug!("Found target channel '{}' (id={})", config.channel, ch_id);
                     }
+                }
+                ControlPacket::UserState(msg) => {
+                    Self::update_user_name_map(&msg, &mut user_names);
                 }
                 ControlPacket::ServerSync(msg) => {
                     session_id = Some(msg.session());
@@ -153,9 +177,10 @@ impl MumbleClient {
         // Spawn receive loop
         let event_tx_recv = event_tx.clone();
         let recv_task = tokio::spawn(async move {
+            let mut user_names = user_names;
             while let Some(packet) = stream.next().await {
                 match packet {
-                    Ok(packet) => Self::handle_packet(packet, &event_tx_recv),
+                    Ok(packet) => Self::handle_packet(packet, &event_tx_recv, &mut user_names),
                     Err(e) => {
                         error!("Error receiving from Mumble: {}", e);
                         break;
@@ -200,6 +225,7 @@ impl MumbleClient {
             session_id,
             channel_id: target_channel_id.unwrap_or(0),
             max_channel_id,
+            channel_names,
             recv_task,
             send_task,
         })
@@ -208,6 +234,7 @@ impl MumbleClient {
     fn handle_packet(
         packet: ControlPacket<mumble_protocol_2x::Clientbound>,
         event_tx: &mpsc::UnboundedSender<MumbleEvent>,
+        user_names: &mut HashMap<u32, String>,
     ) {
         match packet {
             ControlPacket::UDPTunnel(voice_packet) => {
@@ -229,10 +256,64 @@ impl MumbleClient {
             }
             ControlPacket::UserState(msg) => {
                 debug!("User state: session={} name={}", msg.session(), msg.name());
+                Self::update_user_name_map(&msg, user_names);
+                if msg.has_channel_id() {
+                    let _ = event_tx.send(MumbleEvent::UserChangedChannel {
+                        session_id: msg.session(),
+                        channel_id: msg.channel_id(),
+                    });
+                }
+            }
+            ControlPacket::ChannelState(msg) => {
+                let _ = event_tx.send(MumbleEvent::ChannelState {
+                    channel_id: msg.channel_id(),
+                    name: msg.name().to_string(),
+                });
+            }
+            ControlPacket::UserRemove(msg) => {
+                debug!("User removed: session={}", msg.session());
+                Self::remove_user_from_map(msg.session(), user_names);
+                let _ = event_tx.send(MumbleEvent::UserDisconnected {
+                    session_id: msg.session(),
+                });
+            }
+            ControlPacket::TextMessage(msg) => {
+                debug!("Text message: {}", msg.message());
+                let _ = event_tx.send(MumbleEvent::TextMessageReceived {
+                    sender_name: Self::resolve_text_message_sender_name(&msg, user_names),
+                    message: msg.message().to_string(),
+                });
             }
             ControlPacket::Ping(_) => {}
             _ => {}
         }
+    }
+
+    fn update_user_name_map(msg: &msgs::UserState, user_names: &mut HashMap<u32, String>) {
+        if !msg.has_session() || !msg.has_name() {
+            return;
+        }
+        let session_id = msg.session();
+        let name = msg.name().trim();
+        if name.is_empty() {
+            user_names.remove(&session_id);
+        } else {
+            user_names.insert(session_id, name.to_string());
+        }
+    }
+
+    fn remove_user_from_map(session_id: u32, user_names: &mut HashMap<u32, String>) {
+        user_names.remove(&session_id);
+    }
+
+    fn resolve_text_message_sender_name(
+        msg: &msgs::TextMessage,
+        user_names: &HashMap<u32, String>,
+    ) -> Option<String> {
+        if !msg.has_actor() {
+            return None;
+        }
+        user_names.get(&msg.actor()).cloned()
     }
 
     /// Receive the next event from the Mumble connection.
@@ -285,6 +366,11 @@ impl MumbleClient {
         self.max_channel_id
     }
 
+    /// Returns the connect-time channel map (channel_id -> channel name).
+    pub fn channel_names(&self) -> HashMap<u32, String> {
+        self.channel_names.clone()
+    }
+
     /// Get a clonable sender handle for sending voice/control from other tasks.
     pub fn sender(&self) -> MumbleSender {
         MumbleSender {
@@ -333,5 +419,48 @@ impl MumbleSender {
         self.outgoing_tx
             .send(ControlPacket::UDPTunnel(Box::new(voice)))
             .map_err(|_| anyhow::anyhow!("Mumble connection closed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MumbleClient;
+    use mumble_protocol_2x::control::msgs;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resolves_sender_name_for_known_actor() {
+        let mut user_names = HashMap::new();
+
+        let mut user = msgs::UserState::new();
+        user.set_session(12);
+        user.set_name("Sam".to_string());
+        MumbleClient::update_user_name_map(&user, &mut user_names);
+
+        let mut text = msgs::TextMessage::new();
+        text.set_actor(12);
+        text.set_message("hello".to_string());
+
+        let sender = MumbleClient::resolve_text_message_sender_name(&text, &user_names);
+        assert_eq!(sender.as_deref(), Some("Sam"));
+    }
+
+    #[test]
+    fn unknown_actor_has_no_sender_name() {
+        let mut text = msgs::TextMessage::new();
+        text.set_actor(99);
+        text.set_message("hello".to_string());
+
+        let sender = MumbleClient::resolve_text_message_sender_name(&text, &HashMap::new());
+        assert!(sender.is_none());
+    }
+
+    #[test]
+    fn user_remove_clears_sender_mapping() {
+        let mut user_names = HashMap::new();
+        user_names.insert(77, "Alex".to_string());
+
+        MumbleClient::remove_user_from_map(77, &mut user_names);
+        assert!(!user_names.contains_key(&77));
     }
 }

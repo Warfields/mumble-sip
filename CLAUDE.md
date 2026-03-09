@@ -18,9 +18,12 @@ cargo build --release
 # Check / lint
 cargo check
 cargo clippy
-```
 
-There are no tests in this project currently.
+# Run tests (unit tests exist in tts.rs, control.rs, config.rs)
+cargo test
+cargo test --lib -- tts::tests          # TTS tests only
+cargo test --lib -- control::tests      # Mumble control tests only
+```
 
 ## System Dependencies
 
@@ -43,7 +46,7 @@ Two worlds that must be bridged:
 
 2. **Tokio runtime** - All Mumble networking, Opus encoding/decoding, and session management.
 
-**Bridge mechanism:** Lock-free SPSC ring buffers (`ringbuf` crate) carry PCM samples between pjsip's media thread and tokio tasks. An `mpsc` channel carries SIP events (incoming call, state change, media active) from C callbacks to the async event loop.
+**Bridge mechanism:** Lock-free SPSC ring buffers (`ringbuf` crate) carry PCM samples between pjsip's media thread and tokio tasks. An `mpsc` channel carries SIP events (incoming call, state change, media active, DTMF digit) from C callbacks to the async event loop.
 
 ### Per-Call Audio Pipeline
 
@@ -54,19 +57,31 @@ SIP caller <-> pjmedia_port (put_frame/get_frame)
               decoder task: Mumble -> Opus -> mpsc -> PCM -> ringbuf -> pjmedia_port
 ```
 
-Each call spawns 4 tokio tasks: encoder, decoder, voice forwarder, mumble event handler.
+Each call spawns 6 tokio tasks: encoder, decoder, voice forwarder, mumble event handler, TTS announcement worker, and TTS text message worker.
+
+The decoder (`spawn_mixed_decoder`) maintains per-speaker Opus decoder state and mixes all active speakers plus sound effects (join/leave chimes, TTS audio) into a single 10ms output frame per tick.
 
 ### Key Patterns
 
-- **`SendablePort` / `SendablePool`** - Wrapper newtypes to make raw C pointers `Send`+`Sync` for storage in `HashMap` behind `Mutex`.
+- **`SendablePort`** - Wrapper newtype to make raw C pointers `Send`+`Sync` for storage in `HashMap` behind `Mutex`.
 - **`MumbleClient` / `MumbleSender`** - `MumbleClient` owns the connection; `MumbleSender` is a clonable handle (wraps `mpsc::UnboundedSender`) for sending voice from other tasks.
 - **Pending ports** - Media ports are registered in a global `PENDING_PORTS` map by the session manager, then consumed by pjsip's `on_call_media_state` callback when media becomes active.
-- **Deferred cleanup** - Conference bridge port teardown uses a 100ms delay on a dedicated OS thread to ensure pjsip's clock thread has finished its current tick before freeing memory.
+- **Conference port cleanup** - Uses `on_conf_op_completed` callback to detect when `pjsua_conf_remove_port` finishes asynchronously. Cleanup data is registered in `PENDING_CLEANUP` before removal, then the callback destroys the port and releases the pool. Falls back to deferred cleanup (250ms delay on a dedicated OS thread) if the remove fails.
+- **Bridge session tracking** - `bridge_mumble_sessions` (`HashSet<u32>`) tracks Mumble session IDs belonging to this bridge instance. Audio from these sessions is suppressed to prevent feedback loops between co-located SIP callers on the same Mumble server.
+- **Silence detection** - Encoder uses average absolute sample threshold with a 200ms hold period before sending an end-of-transmission Opus frame, matching mumble-web2 behavior.
 - **`PJ_SUCCESS`** is a C macro (value `0`), not exported by bindgen. Compare status codes against `0` directly.
 
-### Call Routing
+### Call Routing & DTMF Navigation
 
 The custom `X-Mumble-Server` SIP header (extracted in `callbacks.rs`) routes calls to different Mumble servers. Without the header, the default from `config.toml` is used. The caller's phone number (from SIP From URI) becomes the Mumble username.
+
+DTMF digits `*`/`#` navigate to previous/next Mumble channel. Channel changes are communicated to the event handler via a `tokio::sync::watch` channel.
+
+### TTS & Sound Effects
+
+- **Sound effects** (`src/audio/sounds.rs`): WAV files in `sounds/` are embedded via `include_bytes!` and lazily decoded to 48kHz PCM on first use. Events: `SelfJoinedChannel`, `UserJoinedChannel`, `UserLeftChannel`, `TextMessage`.
+- **Pocket-TTS** (`src/audio/tts.rs`): Optional sidecar process managed via `uvx pocket-tts serve`. Synthesizes channel-name announcements and text message speech. Uses LRU cache (64 entries). Falls back to chime sound effects when TTS is unavailable. Announcement debouncing prevents rapid-fire channel-change speech.
+- **Link-aware text messages**: HTML anchor tags are parsed for `href` URLs; bare hostnames are detected. URLs are converted to spoken form ("google dot com"). Link-only messages use "posted a link to" phrasing.
 
 ### Audio Constants
 
@@ -74,3 +89,4 @@ The custom `X-Mumble-Server` SIP header (extracted in `callbacks.rs`) routes cal
 - PJSIP media clock: 48kHz to match Opus/Mumble
 - Ring buffer capacity: ~200ms per direction
 - Encoder polls every 5ms for low latency
+- Jitter buffer: configurable, default 60ms (6 frames), minimum 2 frames
