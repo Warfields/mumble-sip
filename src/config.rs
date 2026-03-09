@@ -111,6 +111,11 @@ impl Config {
         Ok(config)
     }
 
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.sip.validate()?;
+        Ok(())
+    }
+
     pub fn sip_config(&self) -> SipConfig {
         SipConfig {
             listen_port: self.sip.listen_port,
@@ -133,6 +138,17 @@ impl Config {
             channel: self.mumble.channel.clone(),
             accept_invalid_cert: self.mumble.accept_invalid_cert,
         }
+    }
+}
+
+impl SipSection {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_concurrent_calls >= 1,
+            "sip.max_concurrent_calls must be 1 or greater (got {})",
+            self.max_concurrent_calls
+        );
+        Ok(())
     }
 }
 
@@ -245,5 +261,41 @@ auto_restart = false
         assert_eq!(parsed.tts.request_timeout_ms, 1_500);
         assert_eq!(parsed.tts.announcement_debounce_ms, 400);
         assert!(!parsed.tts.auto_restart);
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_concurrent_calls() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+listen_port = 5060
+account_uri = "sip:bridge@pbx.example.com"
+max_concurrent_calls = 0
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_positive_max_concurrent_calls() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+listen_port = 5060
+account_uri = "sip:bridge@pbx.example.com"
+max_concurrent_calls = 1
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        parsed.validate().expect("config should validate");
     }
 }

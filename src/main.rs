@@ -24,6 +24,10 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
     let config = Config::load(&config_path)?;
+    if let Err(err) = config.validate() {
+        error!("Configuration validation failed: {}", err);
+        return Err(err);
+    }
     info!("Configuration loaded from {}", config_path);
 
     // Initialize pjsua and get event receiver
