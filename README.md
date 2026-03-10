@@ -87,7 +87,44 @@ auto_restart = true
 
 ### PJSIP Endpoint
 
-Define an endpoint in `pjsip.conf` (or the equivalent in your Asterisk config) for the mumble-sip bridge:
+Define an endpoint in `pjsip.conf` (or the equivalent in your Asterisk config) for the mumble-sip bridge. There are two approaches depending on your network setup:
+
+#### Option A: Dynamic Registration (recommended)
+
+The bridge registers itself with Asterisk using the `[sip].username` and `[sip].password` from `config.toml`. This is the simplest approach and works well when the bridge's IP may change (e.g., DHCP, containers):
+
+```ini
+; pjsip.conf
+
+[mumble-bridge-transport]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+
+[mumble-bridge]
+type = endpoint
+transport = mumble-bridge-transport
+context = mumble-bridge
+disallow = all
+allow = ulaw
+allow = alaw
+aors = mumble-bridge
+auth = mumble-bridge-auth
+
+[mumble-bridge-auth]
+type = auth
+auth_type = userpass
+username = bridge        ; must match [sip].username in config.toml
+password = secret        ; must match [sip].password in config.toml
+
+[mumble-bridge]
+type = aor
+max_contacts = 1
+```
+
+#### Option B: Static IP (no registration)
+
+If the bridge runs at a known, fixed IP you can skip registration entirely. Asterisk identifies the bridge by IP and always knows where to send calls:
 
 ```ini
 ; pjsip.conf
@@ -115,6 +152,8 @@ type = identify
 endpoint = mumble-bridge
 match = 10.0.0.50  ; IP of mumble-sip server
 ```
+
+With this approach, the `[sip].username`, `[sip].password`, and `[sip].registrar` settings in `config.toml` are unused.
 
 ### Dialplan — Basic
 
