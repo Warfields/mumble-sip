@@ -98,12 +98,15 @@ impl CallerStore for SqliteCallerStore {
             // Collision — loop will generate another name
         };
 
-        sqlx::query("INSERT INTO callers (phone_number, nickname, last_seen) VALUES (?, ?, ?)")
-            .bind(phone_number)
-            .bind(&nickname)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO callers (phone_number, nickname, last_seen) VALUES (?, ?, ?)
+             ON CONFLICT(phone_number) DO UPDATE SET last_seen = excluded.last_seen",
+        )
+        .bind(phone_number)
+        .bind(&nickname)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
 
         info!(
             "New caller registered: {} -> {}",

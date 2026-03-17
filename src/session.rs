@@ -438,11 +438,30 @@ impl SessionManager {
 
         // Answer the SIP call — re-register thread since we may have crossed an await boundary
         sip::ensure_pj_thread_registered();
-        unsafe {
+        let answer_failed = unsafe {
             let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
             if status != 0 {
                 error!("Failed to answer call {}: status={}", call_id, status);
+                true
+            } else {
+                false
             }
+        };
+
+        if answer_failed {
+            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
+            // Clean up everything we just set up.
+            callbacks::unregister_pending_port(call_id);
+            encoder_handle.abort();
+            decoder_handle.abort();
+            voice_forward_handle.abort();
+            mumble_event_handle.abort();
+            tts_announce_handle.abort();
+            tts_text_handle.abort();
+            unsafe {
+                media_port::destroy_custom_port(media_port);
+            }
+            return Ok(());
         }
 
         // Initial connect announcement behavior.

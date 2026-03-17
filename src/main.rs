@@ -33,9 +33,6 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("Configuration loaded from {}", config_path);
 
-    // Initialize pjsua and get event receiver
-    let (_endpoint, mut sip_events) = PjsuaEndpoint::init(&config.sip_config())?;
-
     let tts_runtime = if config.tts.enabled {
         match PocketTtsRuntime::new(config.tts.clone(), config.audio.sample_rate) {
             Ok(runtime) => {
@@ -63,6 +60,10 @@ async fn main() -> anyhow::Result<()> {
     // Initialize caller database
     let caller_store: Arc<dyn CallerStore> =
         Arc::new(SqliteCallerStore::new(&config.database.url()).await?);
+
+    // Initialize pjsua and get event receiver — done last so we only accept
+    // calls after TTS and the database are ready.
+    let (_endpoint, mut sip_events) = PjsuaEndpoint::init(&config.sip_config())?;
 
     // Create session manager
     let session_mgr = Arc::new(SessionManager::new(config.clone(), tts_runtime, caller_store));

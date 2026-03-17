@@ -15,6 +15,7 @@ This has been a project I've wanted to do for a while. After joining a startup I
   - `*` for previous channel
   - `#` for next channel
 - Optional Pocket-TTS channel-name announcements (managed sidecar via `uvx`)
+- Persistent caller settings via SQLite — callers get auto-generated nicknames instead of exposing phone numbers
 
 ## Dependencies
 
@@ -56,7 +57,6 @@ max_concurrent_calls = 10
 [mumble]
 default_host = "mumble.example.com"
 port = 64738
-username = "SIP-Bridge"
 password = ""
 channel = "SIP Calls"
 accept_invalid_cert = true
@@ -77,7 +77,16 @@ startup_timeout_ms = 20000
 request_timeout_ms = 3000
 announcement_debounce_ms = 750
 auto_restart = true
+
+[database]
+path = "mumble-sip.db"
 ```
+
+### Caller Nicknames & Database
+
+Callers are assigned Docker-style generated nicknames (e.g. "relaxed_babbage") that persist across calls. Phone numbers are never exposed as Mumble usernames. The nickname mapping is stored in a local SQLite database (default: `mumble-sip.db` in the working directory), created automatically on first run.
+
+The `[database].path` setting controls where the database file is stored. No external database server is required.
 
 ## Usage
 
