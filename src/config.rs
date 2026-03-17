@@ -11,6 +11,8 @@ pub struct Config {
     pub audio: AudioSection,
     #[serde(default)]
     pub tts: TtsSection,
+    #[serde(default)]
+    pub database: DatabaseSection,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -33,14 +35,33 @@ pub struct MumbleSection {
     pub default_host: String,
     #[serde(default = "default_mumble_port")]
     pub port: u16,
-    #[serde(default = "default_mumble_username")]
-    pub username: String,
     #[serde(default)]
     pub password: String,
     #[serde(default)]
     pub channel: String,
     #[serde(default = "default_true")]
     pub accept_invalid_cert: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DatabaseSection {
+    #[serde(default = "default_db_path")]
+    pub path: String,
+}
+
+impl Default for DatabaseSection {
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+        }
+    }
+}
+
+impl DatabaseSection {
+    /// Return the SQLite connection URL for sqlx.
+    pub fn url(&self) -> String {
+        format!("sqlite://{}?mode=rwc", self.path)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,7 +154,7 @@ impl Config {
                 .unwrap_or(&self.mumble.default_host)
                 .to_string(),
             port: self.mumble.port,
-            username: self.mumble.username.clone(),
+            username: String::new(), // Set by caller nickname logic in session.rs
             password: self.mumble.password.clone(),
             channel: self.mumble.channel.clone(),
             accept_invalid_cert: self.mumble.accept_invalid_cert,
@@ -161,8 +182,8 @@ fn default_max_calls() -> u32 {
 fn default_mumble_port() -> u16 {
     64738
 }
-fn default_mumble_username() -> String {
-    "SIP-Bridge".to_string()
+fn default_db_path() -> String {
+    "mumble-sip.db".to_string()
 }
 fn default_true() -> bool {
     true

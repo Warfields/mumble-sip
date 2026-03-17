@@ -13,6 +13,7 @@ use crate::audio::bridge::AudioBridge;
 use crate::audio::sounds::{self, SoundEvent};
 use crate::audio::tts::PocketTtsRuntime;
 use crate::config::Config;
+use crate::db::{self, CallerStore};
 use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
 use crate::sip::callbacks;
@@ -81,14 +82,20 @@ impl DeferredCleanup {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
+    caller_store: Arc<dyn CallerStore>,
     config: Config,
 }
 
 impl SessionManager {
-    pub fn new(config: Config, tts_runtime: Option<Arc<PocketTtsRuntime>>) -> Self {
+    pub fn new(
+        config: Config,
+        tts_runtime: Option<Arc<PocketTtsRuntime>>,
+        caller_store: Arc<dyn CallerStore>,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
+            caller_store,
             config,
         }
     }
@@ -118,9 +125,18 @@ impl SessionManager {
         }
 
         let mut mumble_config = self.config.mumble_config(mumble_server.as_deref());
-        if let Some(ref number) = caller_number {
-            mumble_config.username = number.clone();
-        }
+
+        // Always set Mumble username to a nickname — never leak phone numbers
+        mumble_config.username = match caller_number.as_deref() {
+            Some(number) => match self.caller_store.get_or_create_caller(number).await {
+                Ok(info) => info.nickname,
+                Err(e) => {
+                    warn!("Caller store lookup failed for {number}: {e}");
+                    db::generate_nickname()
+                }
+            },
+            None => db::generate_nickname(),
+        };
         let sample_rate = self.config.audio.sample_rate;
         let configured_frame_ms = self.config.audio.frame_duration_ms;
         if configured_frame_ms != crate::audio::bridge::FRAME_DURATION_MS {

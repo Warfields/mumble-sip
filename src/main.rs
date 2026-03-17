@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod db;
 mod mumble;
 mod session;
 mod sip;
@@ -11,6 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::audio::tts::PocketTtsRuntime;
 use crate::config::Config;
+use crate::db::{CallerStore, SqliteCallerStore};
 use crate::session::SessionManager;
 use crate::sip::PjsuaEndpoint;
 use crate::sip::callbacks::SipEvent;
@@ -58,8 +60,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Initialize caller database
+    let caller_store: Arc<dyn CallerStore> =
+        Arc::new(SqliteCallerStore::new(&config.database.url()).await?);
+
     // Create session manager
-    let session_mgr = Arc::new(SessionManager::new(config.clone(), tts_runtime));
+    let session_mgr = Arc::new(SessionManager::new(config.clone(), tts_runtime, caller_store));
 
     info!("mumble-sip bridge started, waiting for calls...");
 

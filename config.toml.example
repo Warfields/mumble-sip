@@ -9,7 +9,6 @@ max_concurrent_calls = 10
 [mumble]
 default_host = "mumble.example.com"
 port = 64738
-username = "SIP-Bridge"
 password = ""
 channel = "SIP Calls"
 accept_invalid_cert = true
@@ -30,3 +29,6 @@ startup_timeout_ms = 20000
 request_timeout_ms = 3000
 announcement_debounce_ms = 200
 auto_restart = true
+
+[database]
+path = "mumble-sip.db"
