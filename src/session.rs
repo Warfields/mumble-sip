@@ -13,6 +13,7 @@ use crate::audio::bridge::AudioBridge;
 use crate::audio::sounds::{self, SoundEvent};
 use crate::audio::tts::PocketTtsRuntime;
 use crate::config::Config;
+use crate::db::{self, CallerStore};
 use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
 use crate::sip::callbacks;
@@ -81,14 +82,20 @@ impl DeferredCleanup {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
+    caller_store: Arc<dyn CallerStore>,
     config: Config,
 }
 
 impl SessionManager {
-    pub fn new(config: Config, tts_runtime: Option<Arc<PocketTtsRuntime>>) -> Self {
+    pub fn new(
+        config: Config,
+        tts_runtime: Option<Arc<PocketTtsRuntime>>,
+        caller_store: Arc<dyn CallerStore>,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
+            caller_store,
             config,
         }
     }
@@ -118,9 +125,18 @@ impl SessionManager {
         }
 
         let mut mumble_config = self.config.mumble_config(mumble_server.as_deref());
-        if let Some(ref number) = caller_number {
-            mumble_config.username = number.clone();
-        }
+
+        // Always set Mumble username to a nickname — never leak phone numbers
+        mumble_config.username = match caller_number.as_deref() {
+            Some(number) => match self.caller_store.get_or_create_caller(number).await {
+                Ok(info) => info.nickname,
+                Err(e) => {
+                    warn!("Caller store lookup failed for {number}: {e}");
+                    db::generate_nickname()
+                }
+            },
+            None => db::generate_nickname(),
+        };
         let sample_rate = self.config.audio.sample_rate;
         let configured_frame_ms = self.config.audio.frame_duration_ms;
         if configured_frame_ms != crate::audio::bridge::FRAME_DURATION_MS {
@@ -422,11 +438,30 @@ impl SessionManager {
 
         // Answer the SIP call — re-register thread since we may have crossed an await boundary
         sip::ensure_pj_thread_registered();
-        unsafe {
+        let answer_failed = unsafe {
             let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
             if status != 0 {
                 error!("Failed to answer call {}: status={}", call_id, status);
+                true
+            } else {
+                false
             }
+        };
+
+        if answer_failed {
+            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
+            // Clean up everything we just set up.
+            callbacks::unregister_pending_port(call_id);
+            encoder_handle.abort();
+            decoder_handle.abort();
+            voice_forward_handle.abort();
+            mumble_event_handle.abort();
+            tts_announce_handle.abort();
+            tts_text_handle.abort();
+            unsafe {
+                media_port::destroy_custom_port(media_port);
+            }
+            return Ok(());
         }
 
         // Initial connect announcement behavior.

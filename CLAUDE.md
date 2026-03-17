@@ -19,10 +19,11 @@ cargo build --release
 cargo check
 cargo clippy
 
-# Run tests (unit tests exist in tts.rs, control.rs, config.rs)
+# Run tests (unit tests exist in tts.rs, control.rs, config.rs, db.rs)
 cargo test
 cargo test --lib -- tts::tests          # TTS tests only
 cargo test --lib -- control::tests      # Mumble control tests only
+cargo test -- db::tests                 # Database tests only
 ```
 
 ## System Dependencies
@@ -73,7 +74,7 @@ The decoder (`spawn_mixed_decoder`) maintains per-speaker Opus decoder state and
 
 ### Call Routing & DTMF Navigation
 
-The custom `X-Mumble-Server` SIP header (extracted in `callbacks.rs`) routes calls to different Mumble servers. Without the header, the default from `config.toml` is used. The caller's phone number (from SIP From URI) becomes the Mumble username.
+The custom `X-Mumble-Server` SIP header (extracted in `callbacks.rs`) routes calls to different Mumble servers. Without the header, the default from `config.toml` is used. The caller's phone number is extracted from the SIP From URI and used to look up a persistent nickname from the database.
 
 DTMF digits `*`/`#` navigate to previous/next Mumble channel. Channel changes are communicated to the event handler via a `tokio::sync::watch` channel.
 
@@ -82,6 +83,13 @@ DTMF digits `*`/`#` navigate to previous/next Mumble channel. Channel changes ar
 - **Sound effects** (`src/audio/sounds.rs`): WAV files in `sounds/` are embedded via `include_bytes!` and lazily decoded to 48kHz PCM on first use. Events: `SelfJoinedChannel`, `UserJoinedChannel`, `UserLeftChannel`, `TextMessage`.
 - **Pocket-TTS** (`src/audio/tts.rs`): Optional sidecar process managed via `uvx pocket-tts serve`. Synthesizes channel-name announcements and text message speech. Uses LRU cache (64 entries). Falls back to chime sound effects when TTS is unavailable. Announcement debouncing prevents rapid-fire channel-change speech.
 - **Link-aware text messages**: HTML anchor tags are parsed for `href` URLs; bare hostnames are detected. URLs are converted to spoken form ("google dot com"). Link-only messages use "posted a link to" phrasing.
+
+### Persistent Storage
+
+- **SQLite database** (`src/db.rs`): Stores caller data using `sqlx` with async SQLite. The `CallerStore` trait abstracts the storage backend for future portability (e.g. Postgres).
+- **Caller nicknames**: Phone numbers are never exposed as Mumble usernames. Each caller gets a Docker-style generated name (e.g. "relaxed_babbage") via the `names` crate, persisted in the `callers` table keyed by phone number.
+- **Schema migrations**: Managed via `sqlx::migrate!()`, migration files live in `migrations/`. The database is created automatically on first run.
+- **Config**: `[database]` section in `config.toml` with `path` field (default: `mumble-sip.db`).
 
 ### Audio Constants
 
