@@ -1,6 +1,8 @@
 # mumble-sip
 
-A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidirectionally into Mumble servers. Each call gets its own independent Mumble connection, and calls can be routed to different Mumble servers using a custom `X-Mumble-Server` SIP header.
+A SIP-to-Mumble audio bridge. Receives inbound SIP calls and routes audio bidirectionally into Mumble servers. Each call gets its own independent Mumble connection, and calls can be routed to different Mumble servers using a custom `X-Mumble-Server` SIP header. 
+
+This has been a project I've wanted to do for a while. After joining a startup I wanted to really stress test the current generation of models (Opus 4.6) and see what they could really do. Most of this codebase was *vibecoded* I provided high level design, for example I knew that I wanted to bind pjsip into this library since it's fast and battle tested. For the most part almost none of the Rust code was written by a human here.
 
 ## Features
 
