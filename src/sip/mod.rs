@@ -152,6 +152,19 @@ impl PjsuaEndpoint {
     }
 }
 
+impl PjsuaEndpoint {
+    /// Hang up all active calls using pjsua's built-in function.
+    /// pjsip's on_call_state callback fires DISCONNECTED for each call,
+    /// which flows back through the SIP event channel as CallStateChanged.
+    pub fn hangup_all_calls(&self) {
+        ensure_pj_thread_registered();
+        unsafe {
+            pjsua_call_hangup_all();
+        }
+        info!("Sent BYE to all active calls");
+    }
+}
+
 impl Drop for PjsuaEndpoint {
     fn drop(&mut self) {
         info!("Shutting down pjsua");

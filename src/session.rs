@@ -458,6 +458,11 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Number of currently active call sessions tracked by this manager.
+    pub fn active_call_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
     /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
     pub fn on_dtmf_digit(&self, call_id: pjsua_call_id, digit: char) {
         let mut sessions = self.sessions.lock().unwrap();
