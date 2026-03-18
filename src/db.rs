@@ -23,6 +23,21 @@ pub trait CallerStore: Send + Sync {
 
     /// Override a caller's nickname.
     async fn set_nickname(&self, phone_number: &str, nickname: &str) -> Result<()>;
+
+    /// Record the last Mumble channel a caller was in on a given server.
+    async fn set_last_channel_id(
+        &self,
+        phone_number: &str,
+        server_host: &str,
+        channel_id: u32,
+    ) -> Result<()>;
+
+    /// Look up the last Mumble channel a caller was in on a given server.
+    async fn get_last_channel_id(
+        &self,
+        phone_number: &str,
+        server_host: &str,
+    ) -> Result<Option<u32>>;
 }
 
 /// Generate a Docker-style nickname (e.g. "relaxed_babbage").
@@ -128,6 +143,39 @@ impl CallerStore for SqliteCallerStore {
             .await?;
         Ok(())
     }
+
+    async fn set_last_channel_id(
+        &self,
+        phone_number: &str,
+        server_host: &str,
+        channel_id: u32,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO caller_channels (phone_number, server_host, channel_id) VALUES (?, ?, ?)
+             ON CONFLICT(phone_number, server_host) DO UPDATE SET channel_id = excluded.channel_id",
+        )
+        .bind(phone_number)
+        .bind(server_host)
+        .bind(channel_id as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_last_channel_id(
+        &self,
+        phone_number: &str,
+        server_host: &str,
+    ) -> Result<Option<u32>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT channel_id FROM caller_channels WHERE phone_number = ? AND server_host = ?",
+        )
+        .bind(phone_number)
+        .bind(server_host)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id,)| id as u32))
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +221,67 @@ mod tests {
             .unwrap();
         let info = store.get_or_create_caller("5551234567").await.unwrap();
         assert_eq!(info.nickname, "custom_name");
+    }
+
+    #[tokio::test]
+    async fn set_and_get_last_channel_id() {
+        let store = test_store().await;
+        store.get_or_create_caller("5551234567").await.unwrap();
+
+        // No channel stored yet
+        let ch = store
+            .get_last_channel_id("5551234567", "mumble.example.com")
+            .await
+            .unwrap();
+        assert_eq!(ch, None);
+
+        // Store a channel
+        store
+            .set_last_channel_id("5551234567", "mumble.example.com", 42)
+            .await
+            .unwrap();
+        let ch = store
+            .get_last_channel_id("5551234567", "mumble.example.com")
+            .await
+            .unwrap();
+        assert_eq!(ch, Some(42));
+
+        // Update overwrites
+        store
+            .set_last_channel_id("5551234567", "mumble.example.com", 7)
+            .await
+            .unwrap();
+        let ch = store
+            .get_last_channel_id("5551234567", "mumble.example.com")
+            .await
+            .unwrap();
+        assert_eq!(ch, Some(7));
+    }
+
+    #[tokio::test]
+    async fn last_channel_is_per_server() {
+        let store = test_store().await;
+        store.get_or_create_caller("5551234567").await.unwrap();
+
+        store
+            .set_last_channel_id("5551234567", "server-a.example.com", 10)
+            .await
+            .unwrap();
+        store
+            .set_last_channel_id("5551234567", "server-b.example.com", 20)
+            .await
+            .unwrap();
+
+        let a = store
+            .get_last_channel_id("5551234567", "server-a.example.com")
+            .await
+            .unwrap();
+        let b = store
+            .get_last_channel_id("5551234567", "server-b.example.com")
+            .await
+            .unwrap();
+        assert_eq!(a, Some(10));
+        assert_eq!(b, Some(20));
     }
 
     #[test]
