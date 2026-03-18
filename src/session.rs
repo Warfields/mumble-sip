@@ -47,6 +47,10 @@ struct CallSession {
     current_channel_id: u32,
     /// Highest channel ID on this server (from connect-time handshake).
     max_channel_id: u32,
+    /// Caller's phone number (for persisting last channel on disconnect).
+    caller_number: Option<String>,
+    /// Effective Mumble server host (for per-server last-channel lookup).
+    server_host: String,
 }
 
 /// Deferred cleanup data for conference bridge ports.
@@ -84,6 +88,8 @@ pub struct SessionManager {
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
     caller_store: Arc<dyn CallerStore>,
     config: Config,
+    /// Pending DB writes spawned during disconnect, so shutdown can await them.
+    pending_writes: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl SessionManager {
@@ -95,6 +101,7 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
+            pending_writes: Arc::new(Mutex::new(Vec::new())),
             caller_store,
             config,
         }
@@ -126,10 +133,21 @@ impl SessionManager {
 
         let mut mumble_config = self.config.mumble_config(mumble_server.as_deref());
 
-        // Always set Mumble username to a nickname — never leak phone numbers
+        // Always set Mumble username to a nickname — never leak phone numbers.
+        let mut last_channel_id = None;
         mumble_config.username = match caller_number.as_deref() {
             Some(number) => match self.caller_store.get_or_create_caller(number).await {
-                Ok(info) => info.nickname,
+                Ok(info) => {
+                    last_channel_id = self
+                        .caller_store
+                        .get_last_channel_id(number, &mumble_config.host)
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to look up last channel for {number}: {e}");
+                            None
+                        });
+                    info.nickname
+                }
                 Err(e) => {
                     warn!("Caller store lookup failed for {number}: {e}");
                     db::generate_nickname()
@@ -175,8 +193,22 @@ impl SessionManager {
 
         // Get a clonable sender handle for sending voice/control to Mumble
         let mumble_sender = mumble.sender();
-        let initial_channel_id = mumble.channel_id();
+        let mut initial_channel_id = mumble.channel_id();
         let max_channel_id = mumble.max_channel_id();
+
+        // Rejoin the caller's last channel on this server (if it still exists).
+        if let Some(ch) = last_channel_id
+            && ch <= max_channel_id
+            && ch != initial_channel_id
+        {
+            if let Err(e) = mumble_sender.join_channel(ch) {
+                warn!("Failed to rejoin last channel {ch}: {e}");
+            } else {
+                info!("Rejoining caller's last channel {ch}");
+                initial_channel_id = ch;
+            }
+        }
+
         let initial_channel_name = mumble.channel_names().get(&initial_channel_id).cloned();
 
         // Create audio ring buffers (buffer ~200ms of audio)
@@ -359,21 +391,19 @@ impl SessionManager {
                         session_id,
                         opus_data,
                         ..
-                    } => {
-                        match opus_tx.try_send((session_id, opus_data)) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                dropped_decoder_frames += 1;
-                                if dropped_decoder_frames % 100 == 0 {
-                                    warn!(
-                                        "Call {}: dropped {} Mumble Opus frames before mixer due to full queue",
-                                        call_id, dropped_decoder_frames
-                                    );
-                                }
+                    } => match opus_tx.try_send((session_id, opus_data)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            dropped_decoder_frames += 1;
+                            if dropped_decoder_frames % 100 == 0 {
+                                warn!(
+                                    "Call {}: dropped {} Mumble Opus frames before mixer due to full queue",
+                                    call_id, dropped_decoder_frames
+                                );
                             }
-                            Err(TrySendError::Closed(_)) => break,
                         }
-                    }
+                        Err(TrySendError::Closed(_)) => break,
+                    },
                     MumbleEvent::UserChangedChannel {
                         session_id,
                         channel_id,
@@ -485,6 +515,8 @@ impl SessionManager {
             sound_tx: sound_tx.clone(),
             current_channel_id: initial_channel_id,
             max_channel_id,
+            caller_number: caller_number.clone(),
+            server_host: mumble_config.host.clone(),
         };
 
         self.sessions.lock().unwrap().insert(call_id, session);
@@ -496,6 +528,24 @@ impl SessionManager {
     /// Number of currently active call sessions tracked by this manager.
     pub fn active_call_count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// Await all pending DB writes spawned during disconnect.
+    /// Call this before shutting down the runtime to avoid losing data.
+    pub async fn drain_pending_writes(&self) {
+        let handles: Vec<_> = self.pending_writes.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Drop completed DB-write join handles so the manager only retains
+    /// in-flight work during normal runtime.
+    fn reap_completed_writes(&self) {
+        self.pending_writes
+            .lock()
+            .unwrap()
+            .retain(|handle| !handle.is_finished());
     }
 
     /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
@@ -540,6 +590,21 @@ impl SessionManager {
         };
 
         info!("Tearing down session for call {}", call_id);
+        self.reap_completed_writes();
+
+        // Persist the caller's last channel for next reconnect.
+        if let Some(ref phone) = session.caller_number {
+            let store = self.caller_store.clone();
+            let phone = phone.clone();
+            let host = session.server_host.clone();
+            let channel_id = session.current_channel_id;
+            let handle = tokio::spawn(async move {
+                if let Err(e) = store.set_last_channel_id(&phone, &host, channel_id).await {
+                    warn!("Failed to persist last channel for {phone}: {e}");
+                }
+            });
+            self.pending_writes.lock().unwrap().push(handle);
+        }
 
         // Resolve media ownership state before cleanup:
         // - pending: port was never attached to conference
