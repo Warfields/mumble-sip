@@ -88,6 +88,8 @@ pub struct SessionManager {
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
     caller_store: Arc<dyn CallerStore>,
     config: Config,
+    /// Pending DB writes spawned during disconnect, so shutdown can await them.
+    pending_writes: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl SessionManager {
@@ -99,6 +101,7 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
+            pending_writes: Arc::new(Mutex::new(Vec::new())),
             caller_store,
             config,
         }
@@ -527,6 +530,24 @@ impl SessionManager {
         self.sessions.lock().unwrap().len()
     }
 
+    /// Await all pending DB writes spawned during disconnect.
+    /// Call this before shutting down the runtime to avoid losing data.
+    pub async fn drain_pending_writes(&self) {
+        let handles: Vec<_> = self.pending_writes.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Drop completed DB-write join handles so the manager only retains
+    /// in-flight work during normal runtime.
+    fn reap_completed_writes(&self) {
+        self.pending_writes
+            .lock()
+            .unwrap()
+            .retain(|handle| !handle.is_finished());
+    }
+
     /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
     pub fn on_dtmf_digit(&self, call_id: pjsua_call_id, digit: char) {
         let mut sessions = self.sessions.lock().unwrap();
@@ -569,18 +590,20 @@ impl SessionManager {
         };
 
         info!("Tearing down session for call {}", call_id);
+        self.reap_completed_writes();
 
-        // Persist the caller's last channel for next reconnect (fire-and-forget).
+        // Persist the caller's last channel for next reconnect.
         if let Some(ref phone) = session.caller_number {
             let store = self.caller_store.clone();
             let phone = phone.clone();
             let host = session.server_host.clone();
             let channel_id = session.current_channel_id;
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Err(e) = store.set_last_channel_id(&phone, &host, channel_id).await {
                     warn!("Failed to persist last channel for {phone}: {e}");
                 }
             });
+            self.pending_writes.lock().unwrap().push(handle);
         }
 
         // Resolve media ownership state before cleanup:

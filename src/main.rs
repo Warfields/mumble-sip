@@ -66,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
     let (_endpoint, mut sip_events) = PjsuaEndpoint::init(&config.sip_config())?;
 
     // Create session manager
-    let session_mgr = Arc::new(SessionManager::new(config.clone(), tts_runtime, caller_store));
+    let session_mgr = Arc::new(SessionManager::new(
+        config.clone(),
+        tts_runtime,
+        caller_store,
+    ));
 
     info!("mumble-sip bridge started, waiting for calls...");
 
@@ -132,6 +136,19 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // Flush any pending DB writes before the runtime shuts down.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        session_mgr.drain_pending_writes(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("Timed out waiting for pending DB writes to complete");
+    } else {
+        info!("All DB writes drained");
     }
 
     // _endpoint drops here → PjsuaEndpoint::drop() → pjsua_destroy()
