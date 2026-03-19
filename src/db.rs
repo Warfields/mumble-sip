@@ -68,7 +68,7 @@ impl SqliteCallerStore {
     }
 }
 
-fn now_epoch() -> u64 {
+pub(crate) fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")

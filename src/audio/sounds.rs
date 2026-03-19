@@ -45,9 +45,13 @@ pub fn get_sound(event: SoundEvent) -> Vec<i16> {
     get_sound_ref(event).to_vec()
 }
 
-/// Return the duration of a sound event's PCM at 48kHz.
-pub fn sound_duration(event: SoundEvent) -> Duration {
-    Duration::from_secs_f64(get_sound_ref(event).len() as f64 / 48000.0)
+/// Compute the playout duration of a sound effect at the given sample rate.
+///
+/// Sound PCM is always stored at 48kHz, but the mixer drains samples at
+/// `sample_rate` per second, so the actual wall-clock duration depends on
+/// the configured rate, not the stored rate.
+pub fn sound_duration(event: SoundEvent, sample_rate: u32) -> Duration {
+    Duration::from_secs_f64(get_sound_ref(event).len() as f64 / sample_rate as f64)
 }
 
 /// Parse a 16-bit mono PCM WAV and return 48kHz samples.

@@ -66,6 +66,29 @@ fn active_media() -> &'static Mutex<HashMap<pjsua_call_id, ActiveMedia>> {
     ACTIVE_MEDIA.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// One-shot notifiers fired when a call's media port is successfully attached
+/// to the conference bridge.  Registered by SessionManager before answering,
+/// consumed (and fired) by `on_call_media_state`.
+static MEDIA_READY_TX: OnceLock<Mutex<HashMap<pjsua_call_id, tokio::sync::oneshot::Sender<()>>>> =
+    OnceLock::new();
+
+fn media_ready_tx() -> &'static Mutex<HashMap<pjsua_call_id, tokio::sync::oneshot::Sender<()>>> {
+    MEDIA_READY_TX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a one-shot notifier that fires when media becomes active for `call_id`.
+/// Returns the receiving half to await.
+pub fn register_media_ready(call_id: pjsua_call_id) -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    media_ready_tx().lock().unwrap().insert(call_id, tx);
+    rx
+}
+
+/// Remove a media-ready notifier without firing it (e.g. on early teardown).
+pub fn unregister_media_ready(call_id: pjsua_call_id) {
+    media_ready_tx().lock().unwrap().remove(&call_id);
+}
+
 struct PendingCleanup {
     port: *mut pjmedia_port,
     pool: Option<*mut pj_pool_t>,
@@ -354,6 +377,11 @@ unsafe extern "C" fn on_call_media_state(call_id: pjsua_call_id) {
                 pool,
             },
         );
+
+        // Notify any waiting setup task that the audio path is now live.
+        if let Some(tx) = media_ready_tx().lock().unwrap().remove(&call_id) {
+            let _ = tx.send(());
+        }
     }
 }
 
