@@ -548,36 +548,45 @@ impl SessionManager {
             .retain(|handle| !handle.is_finished());
     }
 
-    /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
+    /// Handle a DTMF digit: `1` = intro, `*` = previous channel, `#` = next channel.
     pub fn on_dtmf_digit(&self, call_id: pjsua_call_id, digit: char) {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.get_mut(&call_id) else {
             return;
         };
 
-        let new_channel_id = match digit {
-            '*' => session.current_channel_id.saturating_sub(1),
-            '#' => (session.current_channel_id + 1).min(session.max_channel_id),
+        match digit {
+            '1' => {
+                info!("Call {}: DTMF '1' → playing intro", call_id);
+                let _ = session.sound_tx.send(sounds::get_sound(SoundEvent::Intro));
+            }
+            '*' | '#' => {
+                let new_channel_id = match digit {
+                    '*' => session.current_channel_id.saturating_sub(1),
+                    '#' => (session.current_channel_id + 1).min(session.max_channel_id),
+                    _ => unreachable!(),
+                };
+
+                info!(
+                    "Call {}: DTMF '{}' → navigating from channel {} to {}",
+                    call_id, digit, session.current_channel_id, new_channel_id
+                );
+
+                // Always provide immediate audible feedback for DTMF navigation.
+                let _ = session
+                    .sound_tx
+                    .send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+
+                if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
+                    warn!("Failed to join channel {}: {}", new_channel_id, e);
+                } else {
+                    session.current_channel_id = new_channel_id;
+                    // Notify the event handler of the new channel so it can correctly
+                    // attribute join/leave events.
+                    let _ = session.channel_watch_tx.send(new_channel_id);
+                }
+            }
             _ => return,
-        };
-
-        info!(
-            "Call {}: DTMF '{}' → navigating from channel {} to {}",
-            call_id, digit, session.current_channel_id, new_channel_id
-        );
-
-        // Always provide immediate audible feedback for DTMF navigation.
-        let _ = session
-            .sound_tx
-            .send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
-
-        if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
-            warn!("Failed to join channel {}: {}", new_channel_id, e);
-        } else {
-            session.current_channel_id = new_channel_id;
-            // Notify the event handler of the new channel so it can correctly
-            // attribute join/leave events.
-            let _ = session.channel_watch_tx.send(new_channel_id);
         }
     }
 
