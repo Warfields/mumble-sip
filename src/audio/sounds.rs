@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 const CONNECTED_WAV: &[u8] = include_bytes!("../../sounds/ServerConnected.wav");
 const USER_JOINED_WAV: &[u8] = include_bytes!("../../sounds/UserJoinedChannel.wav");
@@ -21,10 +22,10 @@ pub enum SoundEvent {
     Intro,
 }
 
-/// Get the pre-decoded 48kHz mono PCM for a sound event.
+/// Get a static reference to the pre-decoded 48kHz mono PCM for a sound event.
 /// Decoded on first call, cached thereafter.
-pub fn get_sound(event: SoundEvent) -> Vec<i16> {
-    let pcm = match event {
+fn get_sound_ref(event: SoundEvent) -> &'static [i16] {
+    match event {
         SoundEvent::SelfJoinedChannel => {
             CONNECTED_PCM.get_or_init(|| decode_wav_48k(CONNECTED_WAV))
         }
@@ -36,8 +37,17 @@ pub fn get_sound(event: SoundEvent) -> Vec<i16> {
             TEXT_MESSAGE_PCM.get_or_init(|| decode_wav_48k(TEXT_MESSAGE_WAV))
         }
         SoundEvent::Intro => INTRO_PCM.get_or_init(|| decode_wav_48k(INTRO_WAV)),
-    };
-    pcm.clone()
+    }
+}
+
+/// Get a cloned copy of the pre-decoded 48kHz mono PCM for a sound event.
+pub fn get_sound(event: SoundEvent) -> Vec<i16> {
+    get_sound_ref(event).to_vec()
+}
+
+/// Return the duration of a sound event's PCM at 48kHz.
+pub fn sound_duration(event: SoundEvent) -> Duration {
+    Duration::from_secs_f64(get_sound_ref(event).len() as f64 / 48000.0)
 }
 
 /// Parse a 16-bit mono PCM WAV and return 48kHz samples.

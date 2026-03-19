@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use pjsip_sys::*;
@@ -135,6 +135,8 @@ impl SessionManager {
 
         // Always set Mumble username to a nickname — never leak phone numbers.
         let mut last_channel_id = None;
+        let mut should_play_intro = false;
+        let intro_replay_secs = self.config.audio.intro_replay_after_days * 86400;
         mumble_config.username = match caller_number.as_deref() {
             Some(number) => match self.caller_store.get_or_create_caller(number).await {
                 Ok(info) => {
@@ -146,6 +148,14 @@ impl SessionManager {
                             warn!("Failed to look up last channel for {number}: {e}");
                             None
                         });
+                    // Play intro for brand-new callers or callers who haven't
+                    // called in longer than the configured replay period.
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system clock before epoch")
+                        .as_secs();
+                    should_play_intro =
+                        info.is_new || (now.saturating_sub(info.last_seen) >= intro_replay_secs);
                     info.nickname
                 }
                 Err(e) => {
@@ -177,6 +187,79 @@ impl SessionManager {
             call_id, mumble_config.host, mumble_config.port
         );
 
+        // Create audio ring buffers (buffer ~200ms of audio)
+        let buffer_samples = (sample_rate as usize) / 5;
+        let buffers = media_port::create_audio_buffers(buffer_samples);
+
+        // Create the custom media port (uses the ring buffer producer/consumer halves
+        // that face pjsip's media thread).  Wrapped in SendablePort immediately so the
+        // raw pointer is Send-safe across awaits (e.g. the intro sleep).
+        let media_port = SendablePort(unsafe {
+            media_port::create_custom_port(
+                std::ptr::null_mut(), // null pool — we allocate on the heap ourselves
+                sample_rate,
+                samples_per_frame,
+                buffers.sip_to_mumble_prod,
+                buffers.mumble_to_sip_cons,
+            )?
+        });
+
+        // Channel to feed decoded Opus into the decoder
+        let (opus_to_decoder_tx, opus_to_decoder_rx) =
+            mpsc::channel::<(u32, Bytes)>(queue_capacity);
+
+        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
+        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+
+        // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
+        let decoder_handle = AudioBridge::spawn_mixed_decoder(
+            opus_to_decoder_rx,
+            sound_rx,
+            buffers.mumble_to_sip_prod,
+            sample_rate,
+            jitter_frames,
+        );
+
+        // Register the media port so the pjsip callback thread can attach it
+        // to the conference bridge when media becomes active
+        callbacks::register_pending_port(call_id, media_port.0);
+
+        // Answer the SIP call — re-register thread since we may have crossed an await boundary
+        sip::ensure_pj_thread_registered();
+        let answer_failed = unsafe {
+            let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
+            if status != 0 {
+                error!("Failed to answer call {}: status={}", call_id, status);
+                true
+            } else {
+                false
+            }
+        };
+
+        if answer_failed {
+            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
+            // Clean up everything we just set up.
+            callbacks::unregister_pending_port(call_id);
+            decoder_handle.abort();
+            unsafe {
+                media_port::destroy_custom_port(media_port.0);
+            }
+            return Ok(());
+        }
+
+        // Play the intro for first-time callers or those who haven't called recently.
+        // This plays *before* connecting to Mumble so the caller hears it in
+        // isolation, without Mumble chatter competing for their attention, and
+        // so Mumble users don't see the caller until the intro finishes.
+        if should_play_intro {
+            info!("Playing intro for caller (new or returning after absence)");
+            let intro_pcm = sounds::get_sound(SoundEvent::Intro);
+            let intro_duration =
+                Duration::from_secs_f64(intro_pcm.len() as f64 / sample_rate as f64);
+            let _ = sound_tx.send(intro_pcm);
+            tokio::time::sleep(intro_duration).await;
+        }
+
         // Connect to Mumble
         let mut mumble = match MumbleClient::connect(&mumble_config).await {
             Ok(client) => client,
@@ -186,6 +269,31 @@ impl SessionManager {
                 sip::ensure_pj_thread_registered();
                 unsafe {
                     pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+                }
+                // Clean up decoder + media port
+                decoder_handle.abort();
+                callbacks::unregister_pending_port(call_id);
+                // Port may already be active on the conference bridge if media
+                // became active while we were sleeping for the intro.
+                let active_media = callbacks::take_active_media(call_id);
+                if let Some(active) = active_media {
+                    callbacks::register_pending_cleanup(
+                        active.conf_port_id,
+                        media_port.0,
+                        Some(active.pool),
+                    );
+                    let status = unsafe { pjsua_conf_remove_port(active.conf_port_id) };
+                    if status != 0 {
+                        if let Some((port, pool)) =
+                            callbacks::take_pending_cleanup(active.conf_port_id)
+                        {
+                            DeferredCleanup { port, pool }.spawn_deferred();
+                        }
+                    }
+                } else {
+                    unsafe {
+                        media_port::destroy_custom_port(media_port.0);
+                    }
                 }
                 return Err(e);
             }
@@ -211,22 +319,6 @@ impl SessionManager {
 
         let initial_channel_name = mumble.channel_names().get(&initial_channel_id).cloned();
 
-        // Create audio ring buffers (buffer ~200ms of audio)
-        let buffer_samples = (sample_rate as usize) / 5;
-        let buffers = media_port::create_audio_buffers(buffer_samples);
-
-        // Create the custom media port (uses the ring buffer producer/consumer halves
-        // that face pjsip's media thread)
-        let media_port = unsafe {
-            media_port::create_custom_port(
-                std::ptr::null_mut(), // null pool — we allocate on the heap ourselves
-                sample_rate,
-                samples_per_frame,
-                buffers.sip_to_mumble_prod,
-                buffers.mumble_to_sip_cons,
-            )?
-        };
-
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
         let (opus_encoded_tx, mut opus_encoded_rx) =
             mpsc::channel::<(u64, Bytes, bool)>(queue_capacity);
@@ -250,24 +342,9 @@ impl SessionManager {
             }
         });
 
-        // Channel to feed decoded Opus into the decoder
-        let (opus_to_decoder_tx, opus_to_decoder_rx) =
-            mpsc::channel::<(u32, Bytes)>(queue_capacity);
-
-        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
-        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
         let (announcement_tx, mut announcement_rx) =
             mpsc::unbounded_channel::<(u32, Option<String>)>();
         let (text_tts_tx, mut text_tts_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
-
-        // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
-        let decoder_handle = AudioBridge::spawn_mixed_decoder(
-            opus_to_decoder_rx,
-            sound_rx,
-            buffers.mumble_to_sip_prod,
-            sample_rate,
-            jitter_frames,
-        );
 
         let tts_enabled = self.config.tts.enabled;
         let announce_on_connect = self.config.tts.announce_on_connect;
@@ -462,38 +539,6 @@ impl SessionManager {
             }
         });
 
-        // Register the media port so the pjsip callback thread can attach it
-        // to the conference bridge when media becomes active
-        callbacks::register_pending_port(call_id, media_port);
-
-        // Answer the SIP call — re-register thread since we may have crossed an await boundary
-        sip::ensure_pj_thread_registered();
-        let answer_failed = unsafe {
-            let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
-            if status != 0 {
-                error!("Failed to answer call {}: status={}", call_id, status);
-                true
-            } else {
-                false
-            }
-        };
-
-        if answer_failed {
-            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
-            // Clean up everything we just set up.
-            callbacks::unregister_pending_port(call_id);
-            encoder_handle.abort();
-            decoder_handle.abort();
-            voice_forward_handle.abort();
-            mumble_event_handle.abort();
-            tts_announce_handle.abort();
-            tts_text_handle.abort();
-            unsafe {
-                media_port::destroy_custom_port(media_port);
-            }
-            return Ok(());
-        }
-
         // Initial connect announcement behavior.
         if tts_enabled && announce_on_connect {
             let _ = announcement_tx.send((initial_channel_id, initial_channel_name));
@@ -503,7 +548,7 @@ impl SessionManager {
 
         // Store the session
         let session = CallSession {
-            media_port: SendablePort(media_port),
+            media_port,
             encoder_handle,
             decoder_handle,
             voice_forward_handle,

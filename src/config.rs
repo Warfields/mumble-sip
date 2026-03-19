@@ -74,6 +74,8 @@ pub struct AudioSection {
     pub opus_bitrate: u32,
     #[serde(default = "default_jitter_buffer")]
     pub jitter_buffer_ms: u32,
+    #[serde(default = "default_intro_replay_days")]
+    pub intro_replay_after_days: u64,
 }
 
 impl Default for AudioSection {
@@ -83,6 +85,7 @@ impl Default for AudioSection {
             frame_duration_ms: default_frame_duration(),
             opus_bitrate: default_opus_bitrate(),
             jitter_buffer_ms: default_jitter_buffer(),
+            intro_replay_after_days: default_intro_replay_days(),
         }
     }
 }
@@ -199,6 +202,9 @@ fn default_opus_bitrate() -> u32 {
 }
 fn default_jitter_buffer() -> u32 {
     60
+}
+fn default_intro_replay_days() -> u64 {
+    30
 }
 fn default_tts_host() -> String {
     "127.0.0.1".to_string()

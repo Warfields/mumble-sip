@@ -10,7 +10,11 @@ use tracing::info;
 pub struct CallerInfo {
     pub phone_number: String,
     pub nickname: String,
+    /// For new callers this is `now`; for returning callers this is the
+    /// **previous** `last_seen` value (before updating to `now`).
     pub last_seen: u64,
+    /// `true` when the caller was just created (first ever call).
+    pub is_new: bool,
 }
 
 /// Trait abstracting caller storage — session code depends on this, not the concrete backend.
@@ -84,7 +88,7 @@ impl CallerStore for SqliteCallerStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((phone, nickname, _last_seen)) = existing {
+        if let Some((phone, nickname, previous_last_seen)) = existing {
             // Update last_seen
             sqlx::query("UPDATE callers SET last_seen = ? WHERE phone_number = ?")
                 .bind(now)
@@ -95,7 +99,8 @@ impl CallerStore for SqliteCallerStore {
             return Ok(CallerInfo {
                 phone_number: phone,
                 nickname,
-                last_seen: now as u64,
+                last_seen: previous_last_seen as u64,
+                is_new: false,
             });
         }
 
@@ -132,6 +137,7 @@ impl CallerStore for SqliteCallerStore {
             phone_number: phone_number.to_string(),
             nickname,
             last_seen: now as u64,
+            is_new: true,
         })
     }
 
