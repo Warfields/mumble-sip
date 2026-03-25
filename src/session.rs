@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use pjsip_sys::*;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::bridge::AudioBridge;
@@ -90,6 +92,14 @@ pub struct SessionManager {
     config: Config,
     /// Pending DB writes spawned during disconnect, so shutdown can await them.
     pending_writes: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Call IDs currently in setup (between answer and session insertion).
+    /// Each entry is generation-scoped: the setup task owns its entry and is
+    /// the only one that removes it (after cleanup).  `cancel_pending_setup`
+    /// cancels the token but leaves the entry so the generation check can
+    /// prevent a stale task from clobbering a recycled call_id's state.
+    pending_setups: Arc<Mutex<HashMap<pjsua_call_id, (u64, CancellationToken)>>>,
+    /// Monotonic generation counter — each setup attempt gets a unique value.
+    next_setup_generation: AtomicU64,
 }
 
 impl SessionManager {
@@ -102,6 +112,8 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
             pending_writes: Arc::new(Mutex::new(Vec::new())),
+            pending_setups: Arc::new(Mutex::new(HashMap::new())),
+            next_setup_generation: AtomicU64::new(0),
             caller_store,
             config,
         }
@@ -114,10 +126,13 @@ impl SessionManager {
         mumble_server: Option<String>,
         caller_number: Option<String>,
     ) -> anyhow::Result<()> {
-        // Check max concurrent calls
+        // Check max concurrent calls (count both fully-established sessions
+        // and calls still in setup, e.g. playing intro / connecting to Mumble).
         {
             let sessions = self.sessions.lock().unwrap();
-            if sessions.len() >= self.config.sip.max_concurrent_calls as usize {
+            let pending = self.pending_setups.lock().unwrap();
+            let total = sessions.len() + pending.len();
+            if total >= self.config.sip.max_concurrent_calls as usize {
                 warn!(
                     "Max concurrent calls ({}) reached, rejecting call {}",
                     self.config.sip.max_concurrent_calls, call_id
@@ -135,6 +150,9 @@ impl SessionManager {
 
         // Always set Mumble username to a nickname — never leak phone numbers.
         let mut last_channel_id = None;
+        let mut should_play_intro = false;
+        const SECS_PER_DAY: u64 = 86_400;
+        let intro_replay_secs = self.config.audio.intro_replay_after_days * SECS_PER_DAY;
         mumble_config.username = match caller_number.as_deref() {
             Some(number) => match self.caller_store.get_or_create_caller(number).await {
                 Ok(info) => {
@@ -146,6 +164,11 @@ impl SessionManager {
                             warn!("Failed to look up last channel for {number}: {e}");
                             None
                         });
+                    // Play intro for brand-new callers or callers who haven't
+                    // called in longer than the configured replay period.
+                    let now = db::now_epoch();
+                    should_play_intro =
+                        info.is_new || (now.saturating_sub(info.last_seen) >= intro_replay_secs);
                     info.nickname
                 }
                 Err(e) => {
@@ -177,15 +200,149 @@ impl SessionManager {
             call_id, mumble_config.host, mumble_config.port
         );
 
-        // Connect to Mumble
-        let mut mumble = match MumbleClient::connect(&mumble_config).await {
+        // Create audio ring buffers (buffer ~200ms of audio)
+        let buffer_samples = (sample_rate as usize) / 5;
+        let buffers = media_port::create_audio_buffers(buffer_samples);
+
+        // Create the custom media port (uses the ring buffer producer/consumer halves
+        // that face pjsip's media thread).  Wrapped in SendablePort immediately so the
+        // raw pointer is Send-safe across awaits (e.g. the intro sleep).
+        let media_port = SendablePort(unsafe {
+            media_port::create_custom_port(
+                std::ptr::null_mut(), // null pool — we allocate on the heap ourselves
+                sample_rate,
+                samples_per_frame,
+                buffers.sip_to_mumble_prod,
+                buffers.mumble_to_sip_cons,
+            )?
+        });
+
+        // Channel to feed decoded Opus into the decoder
+        let (opus_to_decoder_tx, opus_to_decoder_rx) =
+            mpsc::channel::<(u32, Bytes)>(queue_capacity);
+
+        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
+        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+
+        // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
+        let decoder_handle = AudioBridge::spawn_mixed_decoder(
+            opus_to_decoder_rx,
+            sound_rx,
+            buffers.mumble_to_sip_prod,
+            sample_rate,
+            jitter_frames,
+        );
+
+        // Register the media port so the pjsip callback thread can attach it
+        // to the conference bridge when media becomes active
+        callbacks::register_pending_port(call_id, media_port.0);
+
+        // Register a one-shot notifier so we know when the audio path is live
+        // (i.e. on_call_media_state has attached the port to the conference).
+        let media_ready_rx = callbacks::register_media_ready(call_id);
+
+        // Register a cancellation token so on_call_disconnected can signal us
+        // if the caller hangs up at any point before we insert the session.
+        // This covers the media-ready wait, intro sleep, Mumble connect, and
+        // any other await points between answering and session creation.
+        //
+        // The generation scopes this entry to *this* setup attempt.  If pjsua
+        // recycles the call_id before our cleanup finishes, the new call gets
+        // a different generation and our cleanup will not clobber its state.
+        let cancel_token = CancellationToken::new();
+        let generation = self.next_setup_generation.fetch_add(1, Ordering::Relaxed);
+        self.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (generation, cancel_token.clone()));
+
+        // Answer the SIP call — re-register thread since we may have crossed an await boundary
+        sip::ensure_pj_thread_registered();
+        let answer_failed = unsafe {
+            let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
+            if status != 0 {
+                error!("Failed to answer call {}: status={}", call_id, status);
+                true
+            } else {
+                false
+            }
+        };
+
+        if answer_failed {
+            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
+            // Clean up everything we just set up.
+            let owns = self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+            if owns {
+                callbacks::unregister_media_ready(call_id);
+            }
+            return Ok(());
+        }
+
+        // Wait for the audio path to become active before sending any sound
+        // effects.  Without this, the decoder mixes into the ring buffer
+        // before pjsip's get_frame callback starts draining it, and the
+        // ~200ms buffer overflows — truncating the intro.
+        tokio::select! {
+            result = media_ready_rx => {
+                if result.is_err() {
+                    // Sender dropped (e.g. pjsip shut down) — abort setup.
+                    warn!("Media ready channel dropped for call {}, aborting setup", call_id);
+                    self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+                    return Ok(());
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                info!("Call {} disconnected while waiting for media, aborting setup", call_id);
+                let owns = self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+                if owns {
+                    callbacks::unregister_media_ready(call_id);
+                }
+                return Ok(());
+            }
+        }
+
+        // Play the intro for first-time callers or those who haven't called recently.
+        // This plays *after* the media bridge is attached so pjsip's get_frame
+        // callback is actively draining the ring buffer — no samples are lost.
+        // It plays *before* connecting to Mumble so the caller hears it in
+        // isolation, without Mumble chatter competing for their attention, and
+        // so Mumble users don't see the caller until the intro finishes.
+        if should_play_intro {
+            info!("Playing intro for caller (new or returning after absence)");
+            let intro_duration = sounds::sound_duration(SoundEvent::Intro, sample_rate);
+            let _ = sound_tx.send(sounds::get_sound(SoundEvent::Intro));
+
+            tokio::select! {
+                _ = tokio::time::sleep(intro_duration) => {}
+                _ = cancel_token.cancelled() => {
+                    info!("Call {} disconnected during intro playback, aborting setup", call_id);
+                    self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Connect to Mumble.  Wrap in select! so cancellation is detected
+        // promptly instead of waiting for the TCP/TLS handshake to finish.
+        let mumble_result = tokio::select! {
+            result = MumbleClient::connect(&mumble_config) => result,
+            _ = cancel_token.cancelled() => {
+                info!("Call {} disconnected during Mumble connect, aborting setup", call_id);
+                self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+                return Ok(());
+            }
+        };
+
+        let mut mumble = match mumble_result {
             Ok(client) => client,
             Err(e) => {
                 error!("Failed to connect to Mumble for call {}: {}", call_id, e);
-                // Re-register thread — we may have resumed on a different worker after await
-                sip::ensure_pj_thread_registered();
-                unsafe {
-                    pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+                let owns = self.abort_setup(call_id, generation, &decoder_handle, media_port.0);
+                if owns {
+                    // abort_setup already called ensure_pj_thread_registered
+                    unsafe {
+                        pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+                    }
                 }
                 return Err(e);
             }
@@ -211,22 +368,6 @@ impl SessionManager {
 
         let initial_channel_name = mumble.channel_names().get(&initial_channel_id).cloned();
 
-        // Create audio ring buffers (buffer ~200ms of audio)
-        let buffer_samples = (sample_rate as usize) / 5;
-        let buffers = media_port::create_audio_buffers(buffer_samples);
-
-        // Create the custom media port (uses the ring buffer producer/consumer halves
-        // that face pjsip's media thread)
-        let media_port = unsafe {
-            media_port::create_custom_port(
-                std::ptr::null_mut(), // null pool — we allocate on the heap ourselves
-                sample_rate,
-                samples_per_frame,
-                buffers.sip_to_mumble_prod,
-                buffers.mumble_to_sip_cons,
-            )?
-        };
-
         // Spawn encoder: reads PCM from SIP→Mumble ring buffer, encodes Opus
         let (opus_encoded_tx, mut opus_encoded_rx) =
             mpsc::channel::<(u64, Bytes, bool)>(queue_capacity);
@@ -250,24 +391,9 @@ impl SessionManager {
             }
         });
 
-        // Channel to feed decoded Opus into the decoder
-        let (opus_to_decoder_tx, opus_to_decoder_rx) =
-            mpsc::channel::<(u32, Bytes)>(queue_capacity);
-
-        // Sound effect channel: sends pre-decoded PCM to the decoder for mixing
-        let (sound_tx, sound_rx) = mpsc::unbounded_channel::<Vec<i16>>();
         let (announcement_tx, mut announcement_rx) =
             mpsc::unbounded_channel::<(u32, Option<String>)>();
         let (text_tts_tx, mut text_tts_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
-
-        // Spawn mixed decoder: per-speaker decode + 10ms mixdown into Mumble→SIP ring buffer.
-        let decoder_handle = AudioBridge::spawn_mixed_decoder(
-            opus_to_decoder_rx,
-            sound_rx,
-            buffers.mumble_to_sip_prod,
-            sample_rate,
-            jitter_frames,
-        );
 
         let tts_enabled = self.config.tts.enabled;
         let announce_on_connect = self.config.tts.announce_on_connect;
@@ -462,38 +588,6 @@ impl SessionManager {
             }
         });
 
-        // Register the media port so the pjsip callback thread can attach it
-        // to the conference bridge when media becomes active
-        callbacks::register_pending_port(call_id, media_port);
-
-        // Answer the SIP call — re-register thread since we may have crossed an await boundary
-        sip::ensure_pj_thread_registered();
-        let answer_failed = unsafe {
-            let status = pjsua_call_answer(call_id, 200, std::ptr::null(), std::ptr::null());
-            if status != 0 {
-                error!("Failed to answer call {}: status={}", call_id, status);
-                true
-            } else {
-                false
-            }
-        };
-
-        if answer_failed {
-            // Call vanished (e.g. duplicate INVITE already rejected by pjsip).
-            // Clean up everything we just set up.
-            callbacks::unregister_pending_port(call_id);
-            encoder_handle.abort();
-            decoder_handle.abort();
-            voice_forward_handle.abort();
-            mumble_event_handle.abort();
-            tts_announce_handle.abort();
-            tts_text_handle.abort();
-            unsafe {
-                media_port::destroy_custom_port(media_port);
-            }
-            return Ok(());
-        }
-
         // Initial connect announcement behavior.
         if tts_enabled && announce_on_connect {
             let _ = announcement_tx.send((initial_channel_id, initial_channel_name));
@@ -501,9 +595,72 @@ impl SessionManager {
             let _ = sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
         }
 
+        // Atomically transition from pending → active.  If the cancel token
+        // was signalled between the last select! and here (i.e. on_call_disconnected
+        // ran while we were spawning tasks), we must tear down instead of inserting
+        // an orphaned session that no future disconnect event will clean up.
+        let owns = self.remove_pending_setup(call_id, generation);
+
+        if cancel_token.is_cancelled() {
+            warn!(
+                "Call {} disconnected after Mumble connect but before session insertion; tearing down",
+                call_id
+            );
+            encoder_handle.abort();
+            decoder_handle.abort();
+            voice_forward_handle.abort();
+            mumble_event_handle.abort();
+            tts_announce_handle.abort();
+            tts_text_handle.abort();
+
+            if !owns {
+                // Another setup has recycled this call_id — we must not touch
+                // call_id-keyed global state.  Defer media-port destruction
+                // since pjsip's clock thread may still reference it.
+                warn!(
+                    "Call {} recycled during late-cancel teardown; deferring media-port destroy",
+                    call_id
+                );
+                DeferredCleanup {
+                    port: media_port.0,
+                    pool: None,
+                }
+                .spawn_deferred();
+                return Ok(());
+            }
+
+            let active_media = callbacks::take_active_media(call_id);
+            if let Some(active_media) = active_media {
+                callbacks::register_pending_cleanup(
+                    active_media.conf_port_id,
+                    media_port.0,
+                    Some(active_media.pool),
+                );
+                sip::ensure_pj_thread_registered();
+                let status = unsafe { pjsua_conf_remove_port(active_media.conf_port_id) };
+                if status != 0 {
+                    warn!(
+                        "Failed to remove conference port {} for call {} (status={}); using deferred fallback cleanup",
+                        active_media.conf_port_id, call_id, status
+                    );
+                    if let Some((port, pool)) =
+                        callbacks::take_pending_cleanup(active_media.conf_port_id)
+                    {
+                        DeferredCleanup { port, pool }.spawn_deferred();
+                    }
+                }
+            } else {
+                warn!(
+                    "Call {} has no active media state during late-cancel teardown; skipping immediate media-port destroy",
+                    call_id
+                );
+            }
+            return Ok(());
+        }
+
         // Store the session
         let session = CallSession {
-            media_port: SendablePort(media_port),
+            media_port,
             encoder_handle,
             decoder_handle,
             voice_forward_handle,
@@ -512,7 +669,7 @@ impl SessionManager {
             tts_text_handle,
             mumble_sender,
             channel_watch_tx,
-            sound_tx: sound_tx.clone(),
+            sound_tx,
             current_channel_id: initial_channel_id,
             max_channel_id,
             caller_number: caller_number.clone(),
@@ -523,6 +680,96 @@ impl SessionManager {
         info!("Session created for call {}", call_id);
 
         Ok(())
+    }
+
+    /// Common cleanup for aborting a call that is still in setup.
+    /// Removes the pending-setup entry, aborts the decoder, re-registers the
+    /// pjsip thread, and cleans up the media port.  Returns `true` when this
+    /// generation still owns the `call_id` (callers may need this for
+    /// stage-specific cleanup like `unregister_media_ready` or `call_hangup`).
+    fn abort_setup(
+        &self,
+        call_id: pjsua_call_id,
+        generation: u64,
+        decoder_handle: &JoinHandle<()>,
+        port: *mut pjmedia_port,
+    ) -> bool {
+        let owns = self.remove_pending_setup(call_id, generation);
+        decoder_handle.abort();
+        sip::ensure_pj_thread_registered();
+        Self::cleanup_media_port(call_id, port, owns);
+        owns
+    }
+
+    /// Check whether this setup generation still owns the `call_id` in
+    /// `pending_setups` (i.e. no new call has recycled it).
+    fn owns_call_id(&self, call_id: pjsua_call_id, generation: u64) -> bool {
+        let map = self.pending_setups.lock().unwrap();
+        matches!(map.get(&call_id), Some(entry) if entry.0 == generation)
+    }
+
+    /// Remove the `pending_setups` entry only if the generation matches.
+    /// Returns `true` if the entry was removed (i.e. this generation owned it).
+    fn remove_pending_setup(&self, call_id: pjsua_call_id, generation: u64) -> bool {
+        let mut map = self.pending_setups.lock().unwrap();
+        if matches!(map.get(&call_id), Some(entry) if entry.0 == generation) {
+            map.remove(&call_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clean up a media port that may or may not have been attached to the
+    /// conference bridge.  Only touches call_id-keyed global state
+    /// (`PENDING_PORTS`, `ACTIVE_MEDIA`) when `owns_call` is true (the
+    /// caller still owns the call_id in `pending_setups`).  When a new
+    /// call has recycled the call_id, only the port pointer is cleaned up
+    /// via deferred destruction.
+    ///
+    /// Caller must have already called `sip::ensure_pj_thread_registered()`.
+    fn cleanup_media_port(call_id: pjsua_call_id, port: *mut pjmedia_port, owns_call: bool) {
+        if !owns_call {
+            // Another setup now owns this call_id — we must not touch any
+            // call_id-keyed global state.  Defer port destruction to be safe
+            // in case pjsip's clock thread is still referencing it.
+            warn!(
+                "Call {} recycled during cleanup; deferring media-port destroy",
+                call_id
+            );
+            DeferredCleanup { port, pool: None }.spawn_deferred();
+            return;
+        }
+
+        let was_pending = callbacks::unregister_pending_port(call_id).is_some();
+        let active_media = callbacks::take_active_media(call_id);
+
+        if was_pending {
+            // Port was never attached to the conference bridge — safe to
+            // destroy immediately.
+            unsafe {
+                media_port::destroy_custom_port(port);
+            }
+        } else if let Some(active) = active_media {
+            // Port is on the conference bridge — remove asynchronously.
+            callbacks::register_pending_cleanup(active.conf_port_id, port, Some(active.pool));
+            let status = unsafe { pjsua_conf_remove_port(active.conf_port_id) };
+            if status != 0 {
+                if let Some((port, pool)) = callbacks::take_pending_cleanup(active.conf_port_id) {
+                    DeferredCleanup { port, pool }.spawn_deferred();
+                }
+            }
+        } else {
+            // Indeterminate: on_call_media_state consumed the pending entry
+            // but hasn't published active media yet — the callback thread may
+            // still be attaching the port to the conference bridge.  Defer
+            // destruction to avoid use-after-free.
+            warn!(
+                "Call {} media port in indeterminate state during cleanup; deferring destroy",
+                call_id
+            );
+            DeferredCleanup { port, pool: None }.spawn_deferred();
+        }
     }
 
     /// Number of currently active call sessions tracked by this manager.
@@ -548,36 +795,64 @@ impl SessionManager {
             .retain(|handle| !handle.is_finished());
     }
 
-    /// Handle a DTMF digit: `*` = previous channel, `#` = next channel.
+    /// Handle a DTMF digit: `1` = intro, `*` = previous channel, `#` = next channel.
     pub fn on_dtmf_digit(&self, call_id: pjsua_call_id, digit: char) {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.get_mut(&call_id) else {
             return;
         };
 
-        let new_channel_id = match digit {
-            '*' => session.current_channel_id.saturating_sub(1),
-            '#' => (session.current_channel_id + 1).min(session.max_channel_id),
+        match digit {
+            '1' => {
+                info!("Call {}: DTMF '1' → playing intro", call_id);
+                let _ = session.sound_tx.send(sounds::get_sound(SoundEvent::Intro));
+            }
+            '*' | '#' => {
+                let new_channel_id = if digit == '*' {
+                    session.current_channel_id.saturating_sub(1)
+                } else {
+                    (session.current_channel_id + 1).min(session.max_channel_id)
+                };
+
+                info!(
+                    "Call {}: DTMF '{}' → navigating from channel {} to {}",
+                    call_id, digit, session.current_channel_id, new_channel_id
+                );
+
+                // Always provide immediate audible feedback for DTMF navigation.
+                let _ = session
+                    .sound_tx
+                    .send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
+
+                if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
+                    warn!("Failed to join channel {}: {}", new_channel_id, e);
+                } else {
+                    session.current_channel_id = new_channel_id;
+                    // Notify the event handler of the new channel so it can correctly
+                    // attribute join/leave events.
+                    let _ = session.channel_watch_tx.send(new_channel_id);
+                }
+            }
             _ => return,
-        };
+        }
+    }
 
-        info!(
-            "Call {}: DTMF '{}' → navigating from channel {} to {}",
-            call_id, digit, session.current_channel_id, new_channel_id
-        );
-
-        // Always provide immediate audible feedback for DTMF navigation.
-        let _ = session
-            .sound_tx
-            .send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
-
-        if let Err(e) = session.mumble_sender.join_channel(new_channel_id) {
-            warn!("Failed to join channel {}: {}", new_channel_id, e);
+    /// If the call has no active session yet (still in setup), cancel the
+    /// pending setup so it cleans up instead of creating an orphaned session.
+    /// The entry is **not** removed — the setup task owns it and will remove
+    /// it after cleanup, using its generation to avoid clobbering a recycled
+    /// call_id.  Returns `true` if a pending setup was found and cancelled.
+    fn cancel_pending_setup(&self, call_id: pjsua_call_id) -> bool {
+        let map = self.pending_setups.lock().unwrap();
+        if let Some(entry) = map.get(&call_id) {
+            info!(
+                "Call {} disconnected during setup, signalling cancellation",
+                call_id
+            );
+            entry.1.cancel();
+            true
         } else {
-            session.current_channel_id = new_channel_id;
-            // Notify the event handler of the new channel so it can correctly
-            // attribute join/leave events.
-            let _ = session.channel_watch_tx.send(new_channel_id);
+            false
         }
     }
 
@@ -586,6 +861,9 @@ impl SessionManager {
         sip::ensure_pj_thread_registered();
         let session = self.sessions.lock().unwrap().remove(&call_id);
         let Some(session) = session else {
+            // Call may still be in setup (e.g. intro playback). Cancel the
+            // setup task so it cleans up instead of creating an orphaned session.
+            self.cancel_pending_setup(call_id);
             return;
         };
 
@@ -659,5 +937,322 @@ impl SessionManager {
                 call_id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{CallerInfo, CallerStore};
+    use async_trait::async_trait;
+    use std::time::Duration;
+
+    /// Minimal CallerStore that does nothing — tests here don't exercise DB paths.
+    struct StubCallerStore;
+
+    #[async_trait]
+    impl CallerStore for StubCallerStore {
+        async fn get_or_create_caller(&self, phone_number: &str) -> anyhow::Result<CallerInfo> {
+            Ok(CallerInfo {
+                phone_number: phone_number.to_string(),
+                nickname: "test_caller".to_string(),
+                last_seen: 0,
+                is_new: true,
+            })
+        }
+        async fn set_nickname(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_last_channel_id(&self, _: &str, _: &str, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_last_channel_id(&self, _: &str, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    fn test_config() -> Config {
+        test_config_with_max_calls(10)
+    }
+
+    fn test_config_with_max_calls(max: u32) -> Config {
+        toml::from_str(&format!(
+            r#"
+[sip]
+listen_port = 5060
+account_uri = "sip:test@localhost"
+max_concurrent_calls = {max}
+
+[mumble]
+default_host = "localhost"
+"#,
+        ))
+        .expect("test config should parse")
+    }
+
+    fn test_session_manager() -> SessionManager {
+        SessionManager::new(test_config(), None, Arc::new(StubCallerStore))
+    }
+
+    fn test_session_manager_with_max_calls(max: u32) -> SessionManager {
+        SessionManager::new(
+            test_config_with_max_calls(max),
+            None,
+            Arc::new(StubCallerStore),
+        )
+    }
+
+    #[test]
+    fn cancel_pending_setup_cancels_token_but_preserves_entry() {
+        let mgr = test_session_manager();
+        let token = CancellationToken::new();
+
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(42, (0, token.clone()));
+        assert!(!token.is_cancelled());
+
+        let found = mgr.cancel_pending_setup(42);
+        assert!(found);
+        assert!(token.is_cancelled());
+        // Entry is preserved — the setup task owns removal.
+        assert_eq!(mgr.pending_setups.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancel_pending_setup_returns_false_for_unknown_call() {
+        let mgr = test_session_manager();
+        assert!(!mgr.cancel_pending_setup(999));
+    }
+
+    #[test]
+    fn remove_pending_setup_checks_generation() {
+        let mgr = test_session_manager();
+        let token = CancellationToken::new();
+
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(42, (5, token.clone()));
+
+        // Wrong generation — should not remove.
+        assert!(!mgr.remove_pending_setup(42, 99));
+        assert_eq!(mgr.pending_setups.lock().unwrap().len(), 1);
+
+        // Correct generation — should remove.
+        assert!(mgr.remove_pending_setup(42, 5));
+        assert!(mgr.pending_setups.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn owns_call_id_checks_generation() {
+        let mgr = test_session_manager();
+        let token = CancellationToken::new();
+
+        mgr.pending_setups.lock().unwrap().insert(42, (7, token));
+
+        assert!(mgr.owns_call_id(42, 7));
+        assert!(!mgr.owns_call_id(42, 99));
+        assert!(!mgr.owns_call_id(999, 7));
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_intro_aborts_setup() {
+        // Simulates the select! pattern used during intro playback: a long
+        // sleep races against a cancellation token. Cancelling the token
+        // causes the setup to abort before Mumble connect.
+        let mgr = Arc::new(test_session_manager());
+        let call_id: pjsua_call_id = 7;
+        let generation: u64 = 0;
+
+        let token = CancellationToken::new();
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (generation, token.clone()));
+
+        let mgr2 = mgr.clone();
+        let setup_task = tokio::spawn(async move {
+            // Simulate intro sleep with cancellation check (mirrors on_incoming_call).
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    panic!("should not reach post-intro setup");
+                }
+                _ = token.cancelled() => {
+                    // Cleanup path — task removes its own entry.
+                    mgr2.remove_pending_setup(call_id, generation);
+                }
+            }
+        });
+
+        // Simulate disconnect arriving during intro playback.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cancelled = mgr.cancel_pending_setup(call_id);
+        assert!(cancelled, "should find and cancel the pending setup");
+
+        setup_task.await.unwrap();
+
+        assert!(
+            mgr.sessions.lock().unwrap().is_empty(),
+            "no session should exist after disconnect during intro"
+        );
+        assert!(mgr.pending_setups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_mumble_connect_aborts_via_select() {
+        // Simulates a disconnect arriving while MumbleClient::connect is
+        // in progress.  The select! on the connect future detects
+        // cancellation promptly without waiting for the connect to finish.
+        let mgr = Arc::new(test_session_manager());
+        let call_id: pjsua_call_id = 8;
+        let generation: u64 = 0;
+
+        let token = CancellationToken::new();
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (generation, token.clone()));
+
+        let mgr2 = mgr.clone();
+        let setup_task = tokio::spawn(async move {
+            // Simulate Mumble connect wrapped in select! (mirrors on_incoming_call).
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    panic!("should not reach post-connect setup");
+                }
+                _ = token.cancelled() => {
+                    // Cleanup — task removes its own entry.
+                    mgr2.remove_pending_setup(call_id, generation);
+                }
+            }
+        });
+
+        // Disconnect arrives while "Mumble connect" is in progress.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cancelled = mgr.cancel_pending_setup(call_id);
+        assert!(cancelled);
+
+        setup_task.await.unwrap();
+
+        assert!(
+            mgr.sessions.lock().unwrap().is_empty(),
+            "no session should exist after disconnect during Mumble connect"
+        );
+        assert!(mgr.pending_setups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_task_does_not_clobber_recycled_call_id() {
+        // Simulates the race: old task is cancelled mid-connect, pjsua
+        // recycles the call_id for a new call before the old task cleans up.
+        // The old task's generation check must prevent it from removing the
+        // new call's pending_setups entry.
+        let mgr = Arc::new(test_session_manager());
+        let call_id: pjsua_call_id = 5;
+        let old_gen: u64 = 0;
+        let new_gen: u64 = 1;
+
+        let old_token = CancellationToken::new();
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (old_gen, old_token.clone()));
+
+        let mgr2 = mgr.clone();
+        let old_task = tokio::spawn(async move {
+            // Simulate a long Mumble connect.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = old_token.cancelled() => {}
+            }
+
+            // Old task wakes up and tries cleanup.
+            // It should NOT remove the entry because generation changed.
+            let owns = mgr2.owns_call_id(call_id, old_gen);
+            assert!(!owns, "old task should not own the call_id anymore");
+            mgr2.remove_pending_setup(call_id, old_gen);
+        });
+
+        // Disconnect the old call.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        mgr.cancel_pending_setup(call_id);
+
+        // New call arrives with the same call_id before old task finishes.
+        let new_token = CancellationToken::new();
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (new_gen, new_token.clone()));
+
+        old_task.await.unwrap();
+
+        // The new call's entry must still be intact.
+        assert!(
+            mgr.owns_call_id(call_id, new_gen),
+            "new call's pending_setups entry must survive old task cleanup"
+        );
+        assert!(
+            !new_token.is_cancelled(),
+            "new call's token must not be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_setup_completes_when_no_disconnect() {
+        // Verifies that the cancellation mechanism does not interfere with
+        // normal call setup when no disconnect occurs.
+        let mgr = Arc::new(test_session_manager());
+        let call_id: pjsua_call_id = 10;
+        let generation: u64 = 0;
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let token = CancellationToken::new();
+        mgr.pending_setups
+            .lock()
+            .unwrap()
+            .insert(call_id, (generation, token.clone()));
+
+        let mgr2 = mgr.clone();
+        let token2 = token.clone();
+        let completed2 = completed.clone();
+        let setup_task = tokio::spawn(async move {
+            // Simulate intro + Mumble connect without disconnect.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            if token2.is_cancelled() {
+                return;
+            }
+
+            // "Session insertion" — remove token and mark complete.
+            mgr2.remove_pending_setup(call_id, generation);
+            completed2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        setup_task.await.unwrap();
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "setup should complete normally when no disconnect occurs"
+        );
+        assert!(mgr.pending_setups.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_setups_count_toward_max_concurrent_calls() {
+        let mgr = test_session_manager_with_max_calls(1);
+
+        // Simulate one call in setup (not yet a full session).
+        let token = CancellationToken::new();
+        mgr.pending_setups.lock().unwrap().insert(100, (0, token));
+
+        // The concurrency gate should now count this pending call.
+        let total = mgr.sessions.lock().unwrap().len() + mgr.pending_setups.lock().unwrap().len();
+        assert!(
+            total >= mgr.config.sip.max_concurrent_calls as usize,
+            "pending setup should count toward the concurrency limit"
+        );
     }
 }

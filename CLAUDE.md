@@ -76,11 +76,15 @@ The decoder (`spawn_mixed_decoder`) maintains per-speaker Opus decoder state and
 
 The custom `X-Mumble-Server` SIP header (extracted in `callbacks.rs`) routes calls to different Mumble servers. Without the header, the default from `config.toml` is used. The caller's phone number is extracted from the SIP From URI and used to look up a persistent nickname from the database.
 
-DTMF digits `*`/`#` navigate to previous/next Mumble channel. Channel changes are communicated to the event handler via a `tokio::sync::watch` channel. On reconnect, callers automatically rejoin the last channel they were in (per Mumble server), looked up from the `caller_channels` table.
+DTMF digits `*`/`#` navigate to previous/next Mumble channel. `1` replays the intro message. Channel changes are communicated to the event handler via a `tokio::sync::watch` channel. On reconnect, callers automatically rejoin the last channel they were in (per Mumble server), looked up from the `caller_channels` table.
+
+### Intro Auto-Play
+
+First-time callers (`is_new` flag from `CallerStore`) or callers returning after a configurable absence (`audio.intro_replay_after_days`, default 30) automatically hear the intro message. The intro plays **before** the Mumble connection is established — the SIP call is answered and audio pipeline started, but Mumble connect is deferred until the intro finishes. This ensures the caller hears the intro without Mumble chatter and is not visible to Mumble users until ready. The `CallerInfo.last_seen` field returns the **previous** value (before updating to now) to enable staleness checks.
 
 ### TTS & Sound Effects
 
-- **Sound effects** (`src/audio/sounds.rs`): WAV files in `sounds/` are embedded via `include_bytes!` and lazily decoded to 48kHz PCM on first use. Events: `SelfJoinedChannel`, `UserJoinedChannel`, `UserLeftChannel`, `TextMessage`.
+- **Sound effects** (`src/audio/sounds.rs`): WAV files in `sounds/` are embedded via `include_bytes!` and lazily decoded to 48kHz PCM on first use. Events: `SelfJoinedChannel`, `UserJoinedChannel`, `UserLeftChannel`, `TextMessage`, `Intro`. The `sound_duration()` helper computes playback duration from PCM sample count at runtime.
 - **Pocket-TTS** (`src/audio/tts.rs`): Optional sidecar process managed via `uvx pocket-tts serve`. Synthesizes channel-name announcements and text message speech. Uses LRU cache (64 entries). Falls back to chime sound effects when TTS is unavailable. Announcement debouncing prevents rapid-fire channel-change speech.
 - **Link-aware text messages**: HTML anchor tags are parsed for `href` URLs; bare hostnames are detected. URLs are converted to spoken form ("google dot com"). Link-only messages use "posted a link to" phrasing.
 

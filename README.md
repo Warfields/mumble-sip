@@ -14,6 +14,8 @@ This has been a project I've wanted to do for a while. After joining a startup I
 - DTMF Navigation
   - `*` for previous channel
   - `#` for next channel
+  - `1` to replay the intro message
+- Automatic intro playback for first-time callers or callers returning after a configurable absence (default 30 days) — plays before connecting to Mumble so it's heard clearly
 - Optional Pocket-TTS channel-name announcements (managed sidecar via `uvx`)
 - Persistent caller settings via SQLite — callers get auto-generated nicknames instead of exposing phone numbers
 
@@ -66,6 +68,7 @@ sample_rate = 48000
 frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
+intro_replay_after_days = 30
 
 [tts]
 enabled = false

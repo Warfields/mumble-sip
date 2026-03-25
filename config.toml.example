@@ -18,6 +18,7 @@ sample_rate = 48000
 frame_duration_ms = 10
 opus_bitrate = 32000
 jitter_buffer_ms = 60
+intro_replay_after_days = 30
 
 [tts]
 enabled = false
