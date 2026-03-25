@@ -703,6 +703,7 @@ impl SessionManager {
 
     /// Check whether this setup generation still owns the `call_id` in
     /// `pending_setups` (i.e. no new call has recycled it).
+    #[cfg(test)]
     fn owns_call_id(&self, call_id: pjsua_call_id, generation: u64) -> bool {
         let map = self.pending_setups.lock().unwrap();
         matches!(map.get(&call_id), Some(entry) if entry.0 == generation)
