@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pocket-tts
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=20 \
+    CMD curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8000/health
+
+ENTRYPOINT ["pocket-tts", "serve", "--host", "0.0.0.0", "--port", "8000"]

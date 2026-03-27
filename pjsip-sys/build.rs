@@ -182,6 +182,22 @@ fn is_built(pjproject_dir: &Path) -> bool {
     false
 }
 
+/// Find the system prefix for libopus using pkg-config, falling back to /usr.
+fn opus_prefix() -> String {
+    Command::new("pkg-config")
+        .args(["--variable=prefix", "opus"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "/usr".to_string())
+}
+
 fn configure(pjproject_dir: &Path) {
     // Create minimal config_site.h
     let config_site_path = pjproject_dir.join("pjlib/include/pj/config_site.h");
@@ -208,6 +224,8 @@ fn configure(pjproject_dir: &Path) {
         .arg("--disable-pjsua2")
         // We want static libraries only
         .arg("--disable-shared")
+        // Enable Opus codec for wideband/fullband SIP audio
+        .arg(format!("--with-opus={}", opus_prefix()))
         // Disable codecs we don't need (keep G.711 for basic SIP interop)
         .arg("--disable-g7221-codec")
         .arg("--disable-ilbc-codec")
