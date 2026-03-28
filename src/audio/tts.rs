@@ -1,15 +1,21 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use hound::{SampleFormat, WavReader};
 use reqwest::StatusCode;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::config::TtsSection;
 
 const CACHE_CAPACITY: usize = 64;
+const SYNTHESIS_WAIT_BUDGET_MS: u64 = 300;
+const POST_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const POST_FAILURE_RETRY_ATTEMPTS: usize = 4;
+const POST_FAILURE_RETRY_INTERVAL_MS: u64 = 100;
+const POST_FAILURE_HEALTH_TIMEOUT_MS: u64 = 250;
 
 struct CacheState {
     values: HashMap<String, Vec<i16>>,
@@ -53,11 +59,48 @@ impl CacheState {
     }
 }
 
+#[derive(Clone)]
+enum InFlightSynthesisState {
+    Pending,
+    Ready(Result<Vec<i16>, String>),
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeAvailability {
+    Healthy,
+    Recovering,
+    Cooldown(tokio::time::Instant),
+}
+
+struct RuntimeState {
+    availability: RuntimeAvailability,
+}
+
+impl RuntimeState {
+    fn new() -> Self {
+        Self {
+            availability: RuntimeAvailability::Healthy,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestSynthesisBehavior {
+    delay: Duration,
+    result: Result<Vec<i16>, String>,
+    call_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 pub struct PocketTtsRuntime {
     config: TtsSection,
     sample_rate: u32,
     http: reqwest::Client,
     cache: Mutex<CacheState>,
+    in_flight: Mutex<HashMap<String, watch::Receiver<InFlightSynthesisState>>>,
+    runtime_state: Mutex<RuntimeState>,
+    #[cfg(test)]
+    test_synthesis_behavior: Mutex<Option<TestSynthesisBehavior>>,
 }
 
 impl PocketTtsRuntime {
@@ -73,15 +116,19 @@ impl PocketTtsRuntime {
             sample_rate,
             http,
             cache: Mutex::new(CacheState::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            runtime_state: Mutex::new(RuntimeState::new()),
+            #[cfg(test)]
+            test_synthesis_behavior: Mutex::new(None),
         })
     }
 
-    pub async fn startup(&self) -> anyhow::Result<()> {
-        self.ensure_server_ready().await
+    pub async fn startup(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.ensure_server_ready_startup().await
     }
 
     pub async fn synth_channel_announcement(
-        &self,
+        self: &Arc<Self>,
         channel_name: Option<&str>,
         channel_id: u32,
     ) -> anyhow::Result<Vec<i16>> {
@@ -89,13 +136,79 @@ impl PocketTtsRuntime {
         self.synthesize_phrase(&phrase).await
     }
 
-    pub async fn synthesize_phrase(&self, phrase: &str) -> anyhow::Result<Vec<i16>> {
+    pub async fn synthesize_phrase(self: &Arc<Self>, phrase: &str) -> anyhow::Result<Vec<i16>> {
         let cache_key = format!("{}|{}|{}", self.config.voice, self.sample_rate, phrase);
         if let Some(pcm) = self.cache.lock().await.get(&cache_key) {
             return Ok(pcm);
         }
 
-        self.ensure_server_ready().await?;
+        if let Some(receiver) = self.in_flight.lock().await.get(&cache_key).cloned() {
+            return Self::wait_for_in_flight_result(receiver).await;
+        }
+
+        self.assert_runtime_available_for_new_synthesis().await?;
+
+        let mut launch_sender = None;
+        let receiver = {
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(existing) = in_flight.get(&cache_key).cloned() {
+                existing
+            } else {
+                let (sender, receiver) = watch::channel(InFlightSynthesisState::Pending);
+                in_flight.insert(cache_key.clone(), receiver.clone());
+                launch_sender = Some(sender);
+                receiver
+            }
+        };
+
+        if let Some(sender) = launch_sender {
+            let runtime = Arc::clone(self);
+            let phrase = phrase.to_string();
+            let cache_key = cache_key.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_background_synthesis(cache_key, phrase, sender)
+                    .await;
+            });
+        }
+
+        Self::wait_for_in_flight_result(receiver).await
+    }
+
+    async fn run_background_synthesis(
+        self: Arc<Self>,
+        cache_key: String,
+        phrase: String,
+        sender: watch::Sender<InFlightSynthesisState>,
+    ) {
+        let result = self.synthesize_uncached_phrase(&phrase).await;
+        if let Ok(ref pcm) = result {
+            self.cache
+                .lock()
+                .await
+                .insert(cache_key.clone(), pcm.clone());
+            self.mark_runtime_healthy().await;
+        } else {
+            self.handle_runtime_failure().await;
+        }
+
+        let _ = sender.send(InFlightSynthesisState::Ready(
+            result.map_err(|err| err.to_string()),
+        ));
+        self.in_flight.lock().await.remove(&cache_key);
+    }
+
+    async fn synthesize_uncached_phrase(&self, phrase: &str) -> anyhow::Result<Vec<i16>> {
+        #[cfg(test)]
+        if let Some(behavior) = self.test_synthesis_behavior.lock().await.clone() {
+            behavior
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !behavior.delay.is_zero() {
+                tokio::time::sleep(behavior.delay).await;
+            }
+            return behavior.result.map_err(|err| anyhow::anyhow!(err));
+        }
 
         let mut form = vec![("text", phrase.to_string())];
         if !self.config.voice.trim().is_empty() {
@@ -124,12 +237,129 @@ impl PocketTtsRuntime {
             .bytes()
             .await
             .context("failed to read pocket-tts audio")?;
-        let pcm = decode_and_resample_wav(&bytes, self.sample_rate)?;
-        self.cache.lock().await.insert(cache_key, pcm.clone());
-        Ok(pcm)
+        decode_and_resample_wav(&bytes, self.sample_rate)
     }
 
-    async fn ensure_server_ready(&self) -> anyhow::Result<()> {
+    async fn wait_for_in_flight_result(
+        mut receiver: watch::Receiver<InFlightSynthesisState>,
+    ) -> anyhow::Result<Vec<i16>> {
+        if let Some(result) = Self::clone_in_flight_result(&receiver) {
+            return result;
+        }
+
+        let wait_budget = Duration::from_millis(SYNTHESIS_WAIT_BUDGET_MS);
+        let changed = tokio::time::timeout(wait_budget, async {
+            loop {
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("background synthesis channel closed"))?;
+                if let Some(result) = Self::clone_in_flight_result(&receiver) {
+                    return result;
+                }
+            }
+        })
+        .await;
+
+        match changed {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "pocket-tts synthesis did not complete within {}ms",
+                SYNTHESIS_WAIT_BUDGET_MS
+            )),
+        }
+    }
+
+    fn clone_in_flight_result(
+        receiver: &watch::Receiver<InFlightSynthesisState>,
+    ) -> Option<anyhow::Result<Vec<i16>>> {
+        match receiver.borrow().clone() {
+            InFlightSynthesisState::Pending => None,
+            InFlightSynthesisState::Ready(Ok(pcm)) => Some(Ok(pcm)),
+            InFlightSynthesisState::Ready(Err(err)) => Some(Err(anyhow::anyhow!(err))),
+        }
+    }
+
+    async fn assert_runtime_available_for_new_synthesis(&self) -> anyhow::Result<()> {
+        let mut runtime_state = self.runtime_state.lock().await;
+        match runtime_state.availability {
+            RuntimeAvailability::Healthy => Ok(()),
+            RuntimeAvailability::Recovering => {
+                Err(anyhow::anyhow!("pocket-tts is recovering from a failure"))
+            }
+            RuntimeAvailability::Cooldown(until) => {
+                if tokio::time::Instant::now() >= until {
+                    runtime_state.availability = RuntimeAvailability::Healthy;
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "pocket-tts cooldown is active after runtime failures"
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn mark_runtime_healthy(&self) {
+        self.runtime_state.lock().await.availability = RuntimeAvailability::Healthy;
+    }
+
+    async fn handle_runtime_failure(&self) {
+        let should_run_recovery = {
+            let mut runtime_state = self.runtime_state.lock().await;
+            match runtime_state.availability {
+                RuntimeAvailability::Healthy => {
+                    runtime_state.availability = RuntimeAvailability::Recovering;
+                    true
+                }
+                RuntimeAvailability::Recovering => false,
+                RuntimeAvailability::Cooldown(until) => {
+                    if tokio::time::Instant::now() >= until {
+                        runtime_state.availability = RuntimeAvailability::Recovering;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        };
+
+        if !should_run_recovery {
+            return;
+        }
+
+        let recovered = self.run_post_failure_retry_burst().await;
+        let mut runtime_state = self.runtime_state.lock().await;
+        runtime_state.availability = if recovered {
+            RuntimeAvailability::Healthy
+        } else {
+            RuntimeAvailability::Cooldown(tokio::time::Instant::now() + POST_FAILURE_COOLDOWN)
+        };
+    }
+
+    async fn run_post_failure_retry_burst(&self) -> bool {
+        for attempt in 0..POST_FAILURE_RETRY_ATTEMPTS {
+            if self.quick_health_check().await {
+                return true;
+            }
+
+            if attempt + 1 < POST_FAILURE_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(POST_FAILURE_RETRY_INTERVAL_MS)).await;
+            }
+        }
+        false
+    }
+
+    async fn quick_health_check(&self) -> bool {
+        tokio::time::timeout(
+            Duration::from_millis(POST_FAILURE_HEALTH_TIMEOUT_MS),
+            self.health_check(),
+        )
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn ensure_server_ready_startup(&self) -> anyhow::Result<()> {
         if self.health_check().await {
             return Ok(());
         }
@@ -659,11 +889,15 @@ fn linear_resample(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheState, channel_announcement_phrase, decode_and_resample_wav, linear_resample,
-        text_message_phrase,
+        CacheState, PocketTtsRuntime, RuntimeAvailability, channel_announcement_phrase,
+        decode_and_resample_wav, linear_resample, text_message_phrase,
     };
+    use crate::config::TtsSection;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn announcement_phrase_uses_name_when_available() {
@@ -799,5 +1033,126 @@ mod tests {
 
         let pcm = decode_and_resample_wav(&wav, 48_000).expect("decode");
         assert!(!pcm.is_empty());
+    }
+
+    fn test_tts_config() -> TtsSection {
+        TtsSection {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            voice: "eponine".to_string(),
+            announce_on_connect: true,
+            startup_timeout_ms: 1_000,
+            request_timeout_ms: 3_000,
+            announcement_debounce_ms: 10,
+        }
+    }
+
+    async fn runtime_with_test_behavior(
+        delay: Duration,
+        result: Result<Vec<i16>, String>,
+    ) -> (Arc<PocketTtsRuntime>, Arc<AtomicUsize>) {
+        let runtime = Arc::new(PocketTtsRuntime::new(test_tts_config(), 48_000).expect("new"));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        *runtime.test_synthesis_behavior.lock().await = Some(super::TestSynthesisBehavior {
+            delay,
+            result,
+            call_count: Arc::clone(&call_count),
+        });
+        (runtime, call_count)
+    }
+
+    #[tokio::test]
+    async fn uncached_phrase_times_out_then_background_fills_cache() {
+        let (runtime, call_count) =
+            runtime_with_test_behavior(Duration::from_millis(450), Ok(vec![10, 20, 30, 40])).await;
+
+        let start = tokio::time::Instant::now();
+        let first = runtime.synthesize_phrase("timeout phrase").await;
+        let first_elapsed = start.elapsed();
+        assert!(first.is_err(), "first uncached phrase should time out");
+        assert!(
+            first_elapsed < Duration::from_millis(700),
+            "caller should fail fast, elapsed={first_elapsed:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let start = tokio::time::Instant::now();
+        let cached = runtime
+            .synthesize_phrase("timeout phrase")
+            .await
+            .expect("cached phrase");
+        let cached_elapsed = start.elapsed();
+        assert!(!cached.is_empty());
+        assert!(
+            cached_elapsed < Duration::from_millis(100),
+            "cached playback should be immediate, elapsed={cached_elapsed:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "background completion should populate cache without duplicate calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_uncached_requests_share_single_in_flight_synthesis() {
+        let (runtime, call_count) =
+            runtime_with_test_behavior(Duration::from_millis(450), Ok(vec![10, 20, 30, 40])).await;
+
+        let first = runtime.synthesize_phrase("dedupe phrase");
+        let second = runtime.synthesize_phrase("dedupe phrase");
+        let (r1, r2) = tokio::join!(first, second);
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "in-flight dedupe should keep one /tts request"
+        );
+        assert!(runtime.synthesize_phrase("dedupe phrase").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_enters_cooldown_and_allows_retry_after_expiry() {
+        let (runtime, call_count) = runtime_with_test_behavior(
+            Duration::from_millis(10),
+            Err("synthetic failure".to_string()),
+        )
+        .await;
+        let _ = runtime.synthesize_phrase("failure phrase").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let calls_before = call_count.load(Ordering::SeqCst);
+        *runtime.test_synthesis_behavior.lock().await = Some(super::TestSynthesisBehavior {
+            delay: Duration::from_millis(1),
+            result: Ok(vec![1, 2, 3, 4]),
+            call_count: Arc::clone(&call_count),
+        });
+
+        let cooldown_result = runtime.synthesize_phrase("cooldown phrase").await;
+        assert!(
+            cooldown_result.is_err(),
+            "cooldown should force fast fallback without new /tts request"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            calls_before,
+            "cooldown call should not hit /tts"
+        );
+
+        {
+            let mut runtime_state = runtime.runtime_state.lock().await;
+            runtime_state.availability =
+                RuntimeAvailability::Cooldown(tokio::time::Instant::now() - Duration::from_secs(1));
+        }
+
+        let after_expiry = runtime.synthesize_phrase("cooldown phrase").await;
+        assert!(after_expiry.is_ok(), "expired cooldown should allow retry");
+        assert_eq!(call_count.load(Ordering::SeqCst), calls_before + 1);
     }
 }
