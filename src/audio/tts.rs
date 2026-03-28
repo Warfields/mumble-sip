@@ -8,16 +8,30 @@ use hound::{SampleFormat, WavReader};
 use reqwest::StatusCode;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::TtsSection;
 
 const CACHE_CAPACITY: usize = 64;
 const UVX_COMMAND: &str = "uvx";
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 struct CacheState {
     values: HashMap<String, Vec<i16>>,
     order: VecDeque<String>,
+}
+
+struct AvailabilityState {
+    next_retry_at: Option<Instant>,
+}
+
+impl AvailabilityState {
+    fn new() -> Self {
+        Self {
+            next_retry_at: None,
+        }
+    }
 }
 
 impl CacheState {
@@ -63,6 +77,7 @@ pub struct PocketTtsRuntime {
     http: reqwest::Client,
     sidecar: Mutex<Option<Child>>,
     cache: Mutex<CacheState>,
+    availability: Mutex<AvailabilityState>,
 }
 
 impl PocketTtsRuntime {
@@ -79,6 +94,7 @@ impl PocketTtsRuntime {
             http,
             sidecar: Mutex::new(None),
             cache: Mutex::new(CacheState::new()),
+            availability: Mutex::new(AvailabilityState::new()),
         })
     }
 
@@ -136,33 +152,75 @@ impl PocketTtsRuntime {
     }
 
     async fn ensure_server_ready(&self, allow_spawn: bool) -> anyhow::Result<()> {
-        if self.health_check().await {
-            return Ok(());
-        }
-
-        if !allow_spawn {
+        if let Some(remaining) = self.retry_cooldown_remaining().await {
             return Err(anyhow::anyhow!(
-                "pocket-tts sidecar not ready and auto_restart=false"
+                "pocket-tts is in retry cooldown for another {}s",
+                remaining.as_secs().max(1)
             ));
         }
 
-        self.spawn_sidecar_if_needed().await?;
+        if self.health_check().await {
+            self.clear_retry_cooldown().await;
+            return Ok(());
+        }
 
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
-        loop {
-            if self.health_check().await {
-                return Ok(());
-            }
-            self.fail_if_sidecar_exited().await?;
-            if tokio::time::Instant::now() >= deadline {
+        let attempt = async {
+            if !allow_spawn {
                 return Err(anyhow::anyhow!(
-                    "pocket-tts sidecar did not become healthy within {}ms",
-                    self.config.startup_timeout_ms
+                    "pocket-tts sidecar not ready and auto_restart=false"
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            self.spawn_sidecar_if_needed().await?;
+
+            let deadline = Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
+            loop {
+                if self.health_check().await {
+                    return Ok(());
+                }
+                self.fail_if_sidecar_exited().await?;
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "pocket-tts sidecar did not become healthy within {}ms",
+                        self.config.startup_timeout_ms
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
+        .await;
+
+        match attempt {
+            Ok(()) => {
+                self.clear_retry_cooldown().await;
+                Ok(())
+            }
+            Err(err) => {
+                self.arm_retry_cooldown().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn retry_cooldown_remaining(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let mut availability = self.availability.lock().await;
+        match availability.next_retry_at {
+            Some(next_retry_at) if next_retry_at > now => Some(next_retry_at - now),
+            Some(_) => {
+                availability.next_retry_at = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn clear_retry_cooldown(&self) {
+        self.availability.lock().await.next_retry_at = None;
+    }
+
+    async fn arm_retry_cooldown(&self) {
+        self.availability.lock().await.next_retry_at = Some(Instant::now() + RECONNECT_COOLDOWN);
     }
 
     async fn health_check(&self) -> bool {
@@ -726,11 +784,28 @@ fn linear_resample(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheState, channel_announcement_phrase, decode_and_resample_wav, linear_resample,
-        text_message_phrase,
+        CacheState, PocketTtsRuntime, channel_announcement_phrase, decode_and_resample_wav,
+        linear_resample, text_message_phrase,
     };
+    use crate::config::TtsSection;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::io::Cursor;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn test_tts_config() -> TtsSection {
+        TtsSection {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            voice: "test".to_string(),
+            announce_on_connect: true,
+            startup_timeout_ms: 50,
+            request_timeout_ms: 50,
+            announcement_debounce_ms: 100,
+            auto_restart: false,
+        }
+    }
 
     #[test]
     fn announcement_phrase_uses_name_when_available() {
@@ -866,5 +941,38 @@ mod tests {
 
         let pcm = decode_and_resample_wav(&wav, 48_000).expect("decode");
         assert!(!pcm.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_server_ready_fails_fast_during_retry_cooldown() {
+        let runtime = PocketTtsRuntime::new(test_tts_config(), 48_000).expect("runtime");
+        {
+            let mut availability = runtime.availability.lock().await;
+            availability.next_retry_at = Some(Instant::now() + Duration::from_secs(30));
+        }
+
+        let started = Instant::now();
+        let err = runtime
+            .ensure_server_ready(false)
+            .await
+            .expect_err("should fail while cooldown is active");
+
+        assert!(err.to_string().contains("retry cooldown"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_arms_retry_cooldown() {
+        let runtime = PocketTtsRuntime::new(test_tts_config(), 48_000).expect("runtime");
+        let _ = runtime
+            .ensure_server_ready(false)
+            .await
+            .expect_err("unreachable server should fail");
+
+        let remaining = runtime
+            .retry_cooldown_remaining()
+            .await
+            .expect("cooldown should be armed");
+        assert!(remaining > Duration::from_secs(4 * 60));
     }
 }
