@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
         match PocketTtsRuntime::new(config.tts.clone(), config.audio.sample_rate) {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
+                info!(
+                    "Waiting for Pocket-TTS service to become available (timeout: {:.0}s)...",
+                    config.tts.startup_timeout_ms as f64 / 1000.0
+                );
                 if let Err(err) = runtime.startup().await {
                     warn!(
                         "Pocket-TTS service startup check failed (continuing with chime fallback): {}",
