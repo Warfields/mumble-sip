@@ -5,4 +5,4 @@ edition = "2024"
 links = "pjsip"
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
