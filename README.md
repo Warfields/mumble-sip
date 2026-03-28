@@ -16,7 +16,7 @@ This has been a project I've wanted to do for a while. After joining a startup I
   - `#` for next channel
   - `1` to replay the intro message
 - Automatic intro playback for first-time callers or callers returning after a configurable absence (default 30 days) — plays before connecting to Mumble so it's heard clearly
-- Optional Pocket-TTS channel-name announcements (managed sidecar via `uvx`)
+- Optional Pocket-TTS channel-name announcements via HTTP service
 - Persistent caller settings via SQLite — callers get auto-generated nicknames instead of exposing phone numbers
 
 ## Dependencies
@@ -29,7 +29,6 @@ This has been a project I've wanted to do for a while. After joining a startup I
 - Opus development library (`libopus-dev`)
 - UUID library (`uuid-dev`)
 - Rust / cargo
-- `uvx` (only required when `[tts].enabled = true`)
 
 ## Building
 
@@ -79,11 +78,12 @@ announce_on_connect = true
 startup_timeout_ms = 20000
 request_timeout_ms = 3000
 announcement_debounce_ms = 750
-auto_restart = true
 
 [database]
 path = "mumble-sip.db"
 ```
+
+When running with Docker Compose, set `[tts].host = "pocket-tts"` so `mumble-sip` reaches the sibling container.
 
 ### Caller Nicknames & Database
 
@@ -95,6 +95,32 @@ The `[database].path` setting controls where the database file is stored. No ext
 
 ```bash
 ./target/release/mumble-sip config.toml
+```
+
+## Docker Compose
+
+Docker assets live under `docker/`. Run `mumble-sip` and `pocket-tts` together:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+Before starting, make sure your `config.toml` has:
+
+```toml
+[tts]
+enabled = true
+host = "pocket-tts"
+port = 8000
+```
+
+### Multi-arch image build (amd64 + arm64)
+
+If you want to publish images for both `x86_64` and ARM clients:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile -t yourorg/mumble-sip:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.pocket-tts -t yourorg/pocket-tts:latest --push .
 ```
 
 ## Asterisk Integration

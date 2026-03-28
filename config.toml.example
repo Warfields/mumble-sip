@@ -22,14 +22,13 @@ intro_replay_after_days = 30
 
 [tts]
 enabled = false
-host = "127.0.0.1"
+host = "127.0.0.1" # use "pocket-tts" when running via docker compose
 port = 8000
 voice = "eponine"
 announce_on_connect = true
 startup_timeout_ms = 20000
 request_timeout_ms = 3000
 announcement_debounce_ms = 200
-auto_restart = true
 
 [database]
 path = "mumble-sip.db"

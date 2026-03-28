@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
                 let runtime = Arc::new(runtime);
                 if let Err(err) = runtime.startup().await {
                     warn!(
-                        "Pocket-TTS sidecar startup failed (continuing with chime fallback): {}",
+                        "Pocket-TTS service startup check failed (continuing with chime fallback): {}",
                         err
                     );
                 }

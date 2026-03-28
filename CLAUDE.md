@@ -15,6 +15,13 @@ cargo build --release
 # Run
 ./target/release/mumble-sip config.toml
 
+# Docker Compose (Docker assets are in docker/)
+docker compose -f docker/docker-compose.yml up -d --build
+
+# Multi-arch image builds
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile -t yourorg/mumble-sip:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.pocket-tts -t yourorg/pocket-tts:latest --push .
+
 # Check / lint
 cargo check
 cargo clippy
@@ -85,7 +92,7 @@ First-time callers (`is_new` flag from `CallerStore`) or callers returning after
 ### TTS & Sound Effects
 
 - **Sound effects** (`src/audio/sounds.rs`): WAV files in `sounds/` are embedded via `include_bytes!` and lazily decoded to 48kHz PCM on first use. Events: `SelfJoinedChannel`, `UserJoinedChannel`, `UserLeftChannel`, `TextMessage`, `Intro`. The `sound_duration()` helper computes playback duration from PCM sample count at runtime.
-- **Pocket-TTS** (`src/audio/tts.rs`): Optional sidecar process managed via `uvx pocket-tts serve`. Synthesizes channel-name announcements and text message speech. Uses LRU cache (64 entries). Falls back to chime sound effects when TTS is unavailable. Announcement debouncing prevents rapid-fire channel-change speech.
+- **Pocket-TTS** (`src/audio/tts.rs`): Optional external HTTP service (typically a Docker Compose sibling). Synthesizes channel-name announcements and text message speech. Uses LRU cache (64 entries). Falls back to chime sound effects when TTS is unavailable. Announcement debouncing prevents rapid-fire channel-change speech.
 - **Link-aware text messages**: HTML anchor tags are parsed for `href` URLs; bare hostnames are detected. URLs are converted to spoken form ("google dot com"). Link-only messages use "posted a link to" phrasing.
 
 ### Persistent Storage

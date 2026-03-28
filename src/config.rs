@@ -108,8 +108,6 @@ pub struct TtsSection {
     pub request_timeout_ms: u64,
     #[serde(default = "default_tts_announcement_debounce_ms")]
     pub announcement_debounce_ms: u64,
-    #[serde(default = "default_true")]
-    pub auto_restart: bool,
 }
 
 impl Default for TtsSection {
@@ -123,7 +121,6 @@ impl Default for TtsSection {
             startup_timeout_ms: default_tts_startup_timeout_ms(),
             request_timeout_ms: default_tts_request_timeout_ms(),
             announcement_debounce_ms: default_tts_announcement_debounce_ms(),
-            auto_restart: default_true(),
         }
     }
 }
@@ -251,7 +248,6 @@ default_host = "mumble.example.com"
         assert_eq!(parsed.tts.startup_timeout_ms, 20_000);
         assert_eq!(parsed.tts.request_timeout_ms, 3_000);
         assert_eq!(parsed.tts.announcement_debounce_ms, 750);
-        assert!(parsed.tts.auto_restart);
     }
 
     #[test]
@@ -274,7 +270,6 @@ announce_on_connect = false
 startup_timeout_ms = 5000
 request_timeout_ms = 1500
 announcement_debounce_ms = 400
-auto_restart = false
 "#,
         )
         .expect("config should parse");
@@ -287,7 +282,6 @@ auto_restart = false
         assert_eq!(parsed.tts.startup_timeout_ms, 5_000);
         assert_eq!(parsed.tts.request_timeout_ms, 1_500);
         assert_eq!(parsed.tts.announcement_debounce_ms, 400);
-        assert!(!parsed.tts.auto_restart);
     }
 
     #[test]
