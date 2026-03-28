@@ -30,5 +30,10 @@ startup_timeout_ms = 20000
 request_timeout_ms = 3000
 announcement_debounce_ms = 200
 
+[sms]
+enabled = false
+backend = "sip"    # "sip" | "webhook"
+outbound = false   # forward Mumble text messages to callers as SMS
+
 [database]
 path = "mumble-sip.db" # in docker compose this resolves under /data (mounted volume)

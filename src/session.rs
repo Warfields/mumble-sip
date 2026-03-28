@@ -16,6 +16,7 @@ use crate::audio::sounds::{self, SoundEvent};
 use crate::audio::tts::PocketTtsRuntime;
 use crate::config::Config;
 use crate::db::{self, CallerStore};
+use crate::sms::SmsSender;
 use crate::mumble::control::{MumbleClient, MumbleEvent, MumbleSender};
 use crate::sip;
 use crate::sip::callbacks;
@@ -88,6 +89,7 @@ impl DeferredCleanup {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<pjsua_call_id, CallSession>>>,
     tts_runtime: Option<Arc<PocketTtsRuntime>>,
+    sms_sender: Option<Arc<dyn SmsSender>>,
     caller_store: Arc<dyn CallerStore>,
     config: Config,
     /// Pending DB writes spawned during disconnect, so shutdown can await them.
@@ -106,11 +108,13 @@ impl SessionManager {
     pub fn new(
         config: Config,
         tts_runtime: Option<Arc<PocketTtsRuntime>>,
+        sms_sender: Option<Arc<dyn SmsSender>>,
         caller_store: Arc<dyn CallerStore>,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tts_runtime,
+            sms_sender,
             pending_writes: Arc::new(Mutex::new(Vec::new())),
             pending_setups: Arc::new(Mutex::new(HashMap::new())),
             next_setup_generation: AtomicU64::new(0),
@@ -995,12 +999,13 @@ default_host = "localhost"
     }
 
     fn test_session_manager() -> SessionManager {
-        SessionManager::new(test_config(), None, Arc::new(StubCallerStore))
+        SessionManager::new(test_config(), None, None, Arc::new(StubCallerStore))
     }
 
     fn test_session_manager_with_max_calls(max: u32) -> SessionManager {
         SessionManager::new(
             test_config_with_max_calls(max),
+            None,
             None,
             Arc::new(StubCallerStore),
         )
