@@ -40,6 +40,7 @@ services:
     volumes:
       - ../config.toml:/config/config.toml:ro
       - mumble_sip_data:/data
+    working_dir: /data
     environment:
       RUST_LOG: info
     command: ["/config/config.toml"]

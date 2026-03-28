@@ -84,6 +84,7 @@ path = "mumble-sip.db"
 ```
 
 When running with Docker Compose, set `[tts].host = "pocket-tts"` so `mumble-sip` reaches the sibling container.
+For persistence in Docker Compose, keep `[database].path = "mumble-sip.db"` (or set an explicit `/data/...` path); the compose service runs with `working_dir: /data` and mounts `mumble_sip_data` there.
 
 ### Caller Nicknames & Database
 
