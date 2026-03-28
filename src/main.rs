@@ -4,6 +4,7 @@ mod db;
 mod mumble;
 mod session;
 mod sip;
+mod sms;
 
 use std::sync::Arc;
 
@@ -66,9 +67,13 @@ async fn main() -> anyhow::Result<()> {
     let (_endpoint, mut sip_events) = PjsuaEndpoint::init(&config.sip_config())?;
 
     // Create session manager
+    // TODO: Initialize SMS backend when implemented
+    let sms_sender: Option<Arc<dyn sms::SmsSender>> = None;
+
     let session_mgr = Arc::new(SessionManager::new(
         config.clone(),
         tts_runtime,
+        sms_sender,
         caller_store,
     ));
 

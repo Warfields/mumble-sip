@@ -13,6 +13,8 @@ pub struct Config {
     pub tts: TtsSection,
     #[serde(default)]
     pub database: DatabaseSection,
+    #[serde(default)]
+    pub sms: SmsSection,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -125,6 +127,26 @@ impl Default for TtsSection {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct SmsSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sms_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub outbound: bool,
+}
+
+impl Default for SmsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_sms_backend(),
+            outbound: false,
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
@@ -203,6 +225,9 @@ fn default_jitter_buffer() -> u32 {
 fn default_intro_replay_days() -> u64 {
     30
 }
+fn default_sms_backend() -> String {
+    "sip".to_string()
+}
 fn default_tts_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -248,6 +273,10 @@ default_host = "mumble.example.com"
         assert_eq!(parsed.tts.startup_timeout_ms, 20_000);
         assert_eq!(parsed.tts.request_timeout_ms, 3_000);
         assert_eq!(parsed.tts.announcement_debounce_ms, 750);
+
+        assert!(!parsed.sms.enabled);
+        assert_eq!(parsed.sms.backend, "sip");
+        assert!(!parsed.sms.outbound);
     }
 
     #[test]
