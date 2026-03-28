@@ -99,6 +99,10 @@ impl PjsuaEndpoint {
             check_status(pjsua_init(&ua_cfg, &log_cfg, &media_cfg), "pjsua_init")?;
             debug!("pjsua initialized");
 
+            // Log available codecs then prefer wideband/fullband over narrowband G.711
+            log_available_codecs();
+            configure_codec_priorities();
+
             // Create UDP transport
             let mut transport_cfg: pjsua_transport_config = std::mem::zeroed();
             pjsua_transport_config_default(&mut transport_cfg);
@@ -170,6 +174,57 @@ impl Drop for PjsuaEndpoint {
         info!("Shutting down pjsua");
         unsafe {
             pjsua_destroy();
+        }
+    }
+}
+
+/// Log all codecs registered with pjsua. Must be called after pjsua_init().
+fn log_available_codecs() {
+    unsafe {
+        let mut codecs: [pjsua_codec_info; 32] = std::mem::zeroed();
+        let mut count: std::ffi::c_uint = 32;
+        let status = pjsua_enum_codecs(codecs.as_mut_ptr(), &mut count);
+        if status != 0 {
+            warn!("Failed to enumerate codecs (status={})", status);
+            return;
+        }
+        for i in 0..count as usize {
+            let id = &codecs[i].codec_id;
+            let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                id.ptr as *const u8,
+                id.slen as usize,
+            ));
+            debug!("Available codec: {} (priority={})", name, codecs[i].priority);
+        }
+    }
+}
+
+/// Configure codec priorities to prefer wideband/fullband codecs over narrowband.
+/// Must be called after pjsua_init().
+fn configure_codec_priorities() {
+    let priorities: &[(&str, u8)] = &[
+        ("opus/48000", 254),  // Fullband — native Mumble rate
+        ("G722/16000", 200),  // Wideband — widely supported
+        ("speex/16000", 180), // Wideband
+        ("speex/32000", 160), // Ultra-wideband
+        ("PCMU/8000", 100),   // Narrowband fallback
+        ("PCMA/8000", 99),    // Narrowband fallback
+        ("speex/8000", 80),   // Narrowband speex
+    ];
+
+    for (codec_id, priority) in priorities {
+        let cstr = match CString::new(*codec_id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let pj_codec_id = pj_str_from_cstring(&cstr);
+        unsafe {
+            let status = pjsua_codec_set_priority(&pj_codec_id, *priority);
+            if status == 0 {
+                debug!("Codec {} priority set to {}", codec_id, priority);
+            } else {
+                debug!("Codec {} not available (status={})", codec_id, status);
+            }
         }
     }
 }
