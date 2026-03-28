@@ -1,0 +1,49 @@
+name: mumble-sip
+
+services:
+  pocket-tts:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pocket-tts
+    image: mumble-sip/pocket-tts:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "--output",
+          "/dev/null",
+          "http://127.0.0.1:8000/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  mumble-sip:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mumble-sip/mumble-sip:latest
+    restart: unless-stopped
+    depends_on:
+      pocket-tts:
+        condition: service_healthy
+    ports:
+      - "5060:5060/udp"
+    volumes:
+      - ../config.toml:/config/config.toml:ro
+      - mumble_sip_data:/data
+    working_dir: /data
+    environment:
+      RUST_LOG: info
+    command: ["/config/config.toml"]
+
+volumes:
+  mumble_sip_data:

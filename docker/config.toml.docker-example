@@ -21,8 +21,8 @@ jitter_buffer_ms = 60
 intro_replay_after_days = 30
 
 [tts]
-enabled = false
-host = "127.0.0.1" # use "pocket-tts" when running via docker compose
+enabled = true
+host = "pocket-tts"
 port = 8000
 voice = "eponine"
 announce_on_connect = true
@@ -31,4 +31,4 @@ request_timeout_ms = 3000
 announcement_debounce_ms = 200
 
 [database]
-path = "mumble-sip.db" # in docker compose this resolves under /data (mounted volume)
+path = "/data/mumble-sip.db"

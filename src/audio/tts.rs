@@ -1,19 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
 use hound::{SampleFormat, WavReader};
 use reqwest::StatusCode;
-use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
 
 use crate::config::TtsSection;
 
 const CACHE_CAPACITY: usize = 64;
-const UVX_COMMAND: &str = "uvx";
 
 struct CacheState {
     values: HashMap<String, Vec<i16>>,
@@ -61,7 +57,6 @@ pub struct PocketTtsRuntime {
     config: TtsSection,
     sample_rate: u32,
     http: reqwest::Client,
-    sidecar: Mutex<Option<Child>>,
     cache: Mutex<CacheState>,
 }
 
@@ -77,13 +72,12 @@ impl PocketTtsRuntime {
             config,
             sample_rate,
             http,
-            sidecar: Mutex::new(None),
             cache: Mutex::new(CacheState::new()),
         })
     }
 
     pub async fn startup(&self) -> anyhow::Result<()> {
-        self.ensure_server_ready(true).await
+        self.ensure_server_ready().await
     }
 
     pub async fn synth_channel_announcement(
@@ -101,7 +95,7 @@ impl PocketTtsRuntime {
             return Ok(pcm);
         }
 
-        self.ensure_server_ready(self.config.auto_restart).await?;
+        self.ensure_server_ready().await?;
 
         let mut form = vec![("text", phrase.to_string())];
         if !self.config.voice.trim().is_empty() {
@@ -135,18 +129,10 @@ impl PocketTtsRuntime {
         Ok(pcm)
     }
 
-    async fn ensure_server_ready(&self, allow_spawn: bool) -> anyhow::Result<()> {
+    async fn ensure_server_ready(&self) -> anyhow::Result<()> {
         if self.health_check().await {
             return Ok(());
         }
-
-        if !allow_spawn {
-            return Err(anyhow::anyhow!(
-                "pocket-tts sidecar not ready and auto_restart=false"
-            ));
-        }
-
-        self.spawn_sidecar_if_needed().await?;
 
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
@@ -154,10 +140,11 @@ impl PocketTtsRuntime {
             if self.health_check().await {
                 return Ok(());
             }
-            self.fail_if_sidecar_exited().await?;
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow::anyhow!(
-                    "pocket-tts sidecar did not become healthy within {}ms",
+                    "pocket-tts service at {}:{} did not become healthy within {}ms",
+                    self.config.host,
+                    self.config.port,
                     self.config.startup_timeout_ms
                 ));
             }
@@ -178,60 +165,6 @@ impl PocketTtsRuntime {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
-    }
-
-    async fn spawn_sidecar_if_needed(&self) -> anyhow::Result<()> {
-        let mut sidecar = self.sidecar.lock().await;
-        if let Some(child) = sidecar.as_mut() {
-            match child.try_wait() {
-                Ok(None) => return Ok(()),
-                Ok(Some(status)) => {
-                    warn!("pocket-tts sidecar exited with status {}", status);
-                    *sidecar = None;
-                }
-                Err(err) => {
-                    warn!("failed checking pocket-tts sidecar status: {}", err);
-                    *sidecar = None;
-                }
-            }
-        }
-
-        debug!(
-            "starting pocket-tts sidecar: {} pocket-tts serve --port {}",
-            UVX_COMMAND, self.config.port
-        );
-        let child = Command::new(UVX_COMMAND)
-            .arg("pocket-tts")
-            .arg("serve")
-            .arg("--port")
-            .arg(self.config.port.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn pocket-tts sidecar via uvx")?;
-
-        *sidecar = Some(child);
-        Ok(())
-    }
-
-    async fn fail_if_sidecar_exited(&self) -> anyhow::Result<()> {
-        let mut sidecar = self.sidecar.lock().await;
-        let Some(child) = sidecar.as_mut() else {
-            return Ok(());
-        };
-
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to query pocket-tts sidecar status")?
-        {
-            *sidecar = None;
-            return Err(anyhow::anyhow!(
-                "pocket-tts sidecar exited before becoming ready (status={})",
-                status
-            ));
-        }
-        Ok(())
     }
 }
 
