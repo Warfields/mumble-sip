@@ -42,11 +42,15 @@ async fn main() -> anyhow::Result<()> {
                     "Waiting for Pocket-TTS service to become available (timeout: {:.0}s)...",
                     config.tts.startup_timeout_ms as f64 / 1000.0
                 );
-                if let Err(err) = runtime.startup().await {
-                    warn!(
+                match runtime.startup().await {
+                    Ok(()) => info!(
+                        "Pocket-TTS service located at {}:{}",
+                        config.tts.host, config.tts.port
+                    ),
+                    Err(err) => warn!(
                         "Pocket-TTS service startup check failed (continuing with chime fallback): {}",
                         err
-                    );
+                    ),
                 }
                 Some(runtime)
             }

@@ -27,16 +27,13 @@ services:
       start_period: 5s
 
   mumble-sip:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: mumble-sip/mumble-sip:latest
+    image: swarfield/mumble-sip:latest
     restart: unless-stopped
     depends_on:
       pocket-tts:
         condition: service_healthy
     ports:
-      - "5060:5060/udp"
+      - "5061:5060/udp"
     volumes:
       - ../config.toml:/config/config.toml:ro
       - mumble_sip_data:/data
