@@ -2,7 +2,21 @@ name: CI
 
 on:
   push:
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "pjsip-sys/pjproject"
+      - "pjsip-sys/pjproject/**"
+      - ".gitmodules"
   pull_request:
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "pjsip-sys/pjproject"
+      - "pjsip-sys/pjproject/**"
+      - ".gitmodules"
 
 permissions:
   contents: read
