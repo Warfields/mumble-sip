@@ -464,8 +464,6 @@ impl SessionManager {
                     }
                 }
 
-                let _ = tts_sound_tx.send(sounds::get_sound(SoundEvent::SelfJoinedChannel));
-
                 if rx_closed {
                     break;
                 }
