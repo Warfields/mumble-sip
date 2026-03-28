@@ -17,7 +17,7 @@ openssl = "0.10"
 opus = "0.3.1"
 ringbuf = "0.4"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 bytes = "1"
