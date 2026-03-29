@@ -1,17 +1,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use hound::{SampleFormat, WavReader};
 use reqwest::StatusCode;
 use tokio::sync::{Mutex, watch};
+use tracing::debug;
 
 use crate::config::TtsSection;
 
 const CACHE_CAPACITY: usize = 64;
-const SYNTHESIS_WAIT_BUDGET_MS: u64 = 300;
 const POST_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const POST_FAILURE_RETRY_ATTEMPTS: usize = 4;
 const POST_FAILURE_RETRY_INTERVAL_MS: u64 = 100;
@@ -137,8 +137,14 @@ impl PocketTtsRuntime {
     }
 
     pub async fn synthesize_phrase(self: &Arc<Self>, phrase: &str) -> anyhow::Result<Vec<i16>> {
+        let start = Instant::now();
         let cache_key = format!("{}|{}|{}", self.config.voice, self.sample_rate, phrase);
         if let Some(pcm) = self.cache.lock().await.get(&cache_key) {
+            debug!(
+                phrase,
+                elapsed_ms = start.elapsed().as_millis(),
+                "tts cache hit"
+            );
             return Ok(pcm);
         }
 
@@ -181,7 +187,18 @@ impl PocketTtsRuntime {
         phrase: String,
         sender: watch::Sender<InFlightSynthesisState>,
     ) {
+        let start = Instant::now();
         let result = self.synthesize_uncached_phrase(&phrase).await;
+        let elapsed_ms = start.elapsed().as_millis();
+        match &result {
+            Ok(pcm) => debug!(
+                phrase,
+                elapsed_ms,
+                samples = pcm.len(),
+                "tts synthesis completed"
+            ),
+            Err(err) => debug!(phrase, elapsed_ms, %err, "tts synthesis failed"),
+        }
         if let Ok(ref pcm) = result {
             self.cache
                 .lock()
@@ -247,26 +264,14 @@ impl PocketTtsRuntime {
             return result;
         }
 
-        let wait_budget = Duration::from_millis(SYNTHESIS_WAIT_BUDGET_MS);
-        let changed = tokio::time::timeout(wait_budget, async {
-            loop {
-                receiver
-                    .changed()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("background synthesis channel closed"))?;
-                if let Some(result) = Self::clone_in_flight_result(&receiver) {
-                    return result;
-                }
+        loop {
+            receiver
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("background synthesis channel closed"))?;
+            if let Some(result) = Self::clone_in_flight_result(&receiver) {
+                return result;
             }
-        })
-        .await;
-
-        match changed {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "pocket-tts synthesis did not complete within {}ms",
-                SYNTHESIS_WAIT_BUDGET_MS
-            )),
         }
     }
 
