@@ -7,6 +7,7 @@ use std::ffi::CString;
 use pjsip_sys::*;
 use tracing::{debug, error, info, warn};
 
+use crate::config::SrtpMode;
 use crate::sip::callbacks::SipEvent;
 
 /// Register the current (external) thread with pjlib so that pjsua API calls
@@ -60,6 +61,8 @@ pub struct SipConfig {
     pub username: String,
     pub password: String,
     pub max_concurrent_calls: u32,
+    pub srtp_mode: SrtpMode,
+    pub srtp_secure_signaling: u8,
 }
 
 /// Wraps the global pjsua singleton lifecycle.
@@ -146,6 +149,20 @@ impl PjsuaEndpoint {
             acc_cfg.cred_info[0].username = pj_str_from_cstring(&username_cstr);
             acc_cfg.cred_info[0].data_type = 0; // Plaintext password
             acc_cfg.cred_info[0].data = pj_str_from_cstring(&password_cstr);
+
+            acc_cfg.use_srtp = match config.srtp_mode {
+                SrtpMode::Disabled => pjmedia_srtp_use_PJMEDIA_SRTP_DISABLED,
+                SrtpMode::Optional => pjmedia_srtp_use_PJMEDIA_SRTP_OPTIONAL,
+                SrtpMode::Mandatory => pjmedia_srtp_use_PJMEDIA_SRTP_MANDATORY,
+            };
+            acc_cfg.srtp_secure_signaling = config.srtp_secure_signaling as std::os::raw::c_int;
+
+            if config.srtp_mode != SrtpMode::Disabled {
+                info!(
+                    "SRTP mode: {:?}, secure_signaling: {}",
+                    config.srtp_mode, config.srtp_secure_signaling
+                );
+            }
 
             let mut acc_id: pjsua_acc_id = 0;
             check_status(pjsua_acc_add(&acc_cfg, 1, &mut acc_id), "pjsua_acc_add")?;
