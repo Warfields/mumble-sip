@@ -305,7 +305,7 @@ fn discover_target_name(pjproject_dir: &Path) -> String {
         if let Some(rest) = line.strip_prefix("export TARGET_NAME") {
             // Handle both "TARGET_NAME := value" and "TARGET_NAME=value"
             let value = rest
-                .trim_start_matches(|c: char| c == ' ' || c == ':' || c == '=')
+                .trim_start_matches([' ', ':', '='])
                 .trim();
             if !value.is_empty() {
                 return value.to_string();
