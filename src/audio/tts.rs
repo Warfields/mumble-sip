@@ -1068,40 +1068,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncached_phrase_times_out_then_background_fills_cache() {
-        let (runtime, call_count) =
-            runtime_with_test_behavior(Duration::from_millis(450), Ok(vec![10, 20, 30, 40])).await;
-
-        let start = tokio::time::Instant::now();
-        let first = runtime.synthesize_phrase("timeout phrase").await;
-        let first_elapsed = start.elapsed();
-        assert!(first.is_err(), "first uncached phrase should time out");
-        assert!(
-            first_elapsed < Duration::from_millis(700),
-            "caller should fail fast, elapsed={first_elapsed:?}"
-        );
-
-        tokio::time::sleep(Duration::from_millis(700)).await;
-
-        let start = tokio::time::Instant::now();
-        let cached = runtime
-            .synthesize_phrase("timeout phrase")
-            .await
-            .expect("cached phrase");
-        let cached_elapsed = start.elapsed();
-        assert!(!cached.is_empty());
-        assert!(
-            cached_elapsed < Duration::from_millis(100),
-            "cached playback should be immediate, elapsed={cached_elapsed:?}"
-        );
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "background completion should populate cache without duplicate calls"
-        );
-    }
-
-    #[tokio::test]
     async fn concurrent_uncached_requests_share_single_in_flight_synthesis() {
         let (runtime, call_count) =
             runtime_with_test_behavior(Duration::from_millis(450), Ok(vec![10, 20, 30, 40])).await;
@@ -1109,17 +1075,14 @@ mod tests {
         let first = runtime.synthesize_phrase("dedupe phrase");
         let second = runtime.synthesize_phrase("dedupe phrase");
         let (r1, r2) = tokio::join!(first, second);
-        assert!(r1.is_err());
-        assert!(r2.is_err());
-
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(r1.unwrap(), vec![10, 20, 30, 40]);
+        assert_eq!(r2.unwrap(), vec![10, 20, 30, 40]);
 
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
             "in-flight dedupe should keep one /tts request"
         );
-        assert!(runtime.synthesize_phrase("dedupe phrase").await.is_ok());
     }
 
     #[tokio::test]
