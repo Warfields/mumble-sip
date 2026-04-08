@@ -5,6 +5,8 @@ registrar = "sip:pbx.example.com"
 username = "bridge"
 password = "secret"
 max_concurrent_calls = 10
+# srtp_mode = "disabled"        # "disabled" | "optional" | "mandatory"
+# srtp_secure_signaling = 0     # 0 = none, 1 = require TLS, 2 = require SIPS
 
 [mumble]
 default_host = "mumble.example.com"

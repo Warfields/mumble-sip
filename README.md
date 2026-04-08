@@ -83,6 +83,28 @@ announcement_debounce_ms = 750
 path = "mumble-sip.db"
 ```
 
+### SRTP (Encrypted Media)
+
+SRTP encrypts the audio stream between SIP endpoints, preventing eavesdropping on calls. Mumble-sip uses PJSIP's built-in support for SRTP — you only need to enable it in `config.toml`:
+
+```toml
+[sip]
+srtp_mode = "optional"        # "disabled" | "optional" | "mandatory"
+srtp_secure_signaling = 0     # 0 = none, 1 = require TLS, 2 = require SIPS
+```
+
+**`srtp_mode`** controls whether media encryption is used:
+- `"disabled"` (default) — No SRTP. Audio is sent as plain RTP. Incoming SRTP offers are rejected.
+- `"optional"` — SRTP is offered but not required. If the remote side supports it, encrypted media is used; otherwise falls back to plain RTP. **Recommended for most setups.**
+- `"mandatory"` — SRTP is required. Calls fail if the remote side doesn't support SRTP.
+
+**`srtp_secure_signaling`** controls whether SRTP also requires the SIP signaling channel to be encrypted (only applies when `srtp_mode` is not `"disabled"`):
+- `0` (default) — No requirement on signaling security. Works with plain SIP/UDP.
+- `1` — Requires TLS on the SIP signaling transport.
+- `2` — Requires end-to-end SIPS.
+
+> **Note:** TLS SIP transport is not yet supported by mumble-sip, so `srtp_secure_signaling` should remain `0` for now. SRTP keys will be exchanged via SDES over unencrypted SIP, which is acceptable on trusted networks. Your PBX (e.g. Asterisk) must also have SRTP enabled for the endpoint — see your PBX documentation.
+
 When running with Docker Compose, set `[tts].host = "pocket-tts"` so `mumble-sip` reaches the sibling container.
 For persistence in Docker Compose, keep `[database].path = "mumble-sip.db"` (or set an explicit `/data/...` path); the compose service runs with `working_dir: /data` and mounts `mumble_sip_data` there.
 

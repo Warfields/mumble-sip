@@ -3,6 +3,15 @@ use serde::Deserialize;
 use crate::mumble::control::MumbleConfig;
 use crate::sip::SipConfig;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SrtpMode {
+    #[default]
+    Disabled,
+    Optional,
+    Mandatory,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub sip: SipSection,
@@ -30,6 +39,10 @@ pub struct SipSection {
     pub password: String,
     #[serde(default = "default_max_calls")]
     pub max_concurrent_calls: u32,
+    #[serde(default)]
+    pub srtp_mode: SrtpMode,
+    #[serde(default)]
+    pub srtp_secure_signaling: u8,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -167,6 +180,8 @@ impl Config {
             username: self.sip.username.clone(),
             password: self.sip.password.clone(),
             max_concurrent_calls: self.sip.max_concurrent_calls,
+            srtp_mode: self.sip.srtp_mode,
+            srtp_secure_signaling: self.sip.srtp_secure_signaling,
         }
     }
 
@@ -190,6 +205,11 @@ impl SipSection {
             self.max_concurrent_calls >= 1,
             "sip.max_concurrent_calls must be 1 or greater (got {})",
             self.max_concurrent_calls
+        );
+        anyhow::ensure!(
+            self.srtp_secure_signaling <= 2,
+            "sip.srtp_secure_signaling must be 0, 1, or 2 (got {})",
+            self.srtp_secure_signaling
         );
         Ok(())
     }
@@ -249,7 +269,7 @@ fn default_tts_announcement_debounce_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, SrtpMode};
 
     #[test]
     fn parses_tts_defaults_when_section_missing() {
@@ -347,5 +367,75 @@ default_host = "mumble.example.com"
         .expect("config should parse");
 
         parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn srtp_defaults_to_disabled() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+account_uri = "sip:bridge@pbx.example.com"
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(parsed.sip.srtp_mode, SrtpMode::Disabled);
+        assert_eq!(parsed.sip.srtp_secure_signaling, 0);
+    }
+
+    #[test]
+    fn parses_srtp_overrides() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+account_uri = "sip:bridge@pbx.example.com"
+srtp_mode = "mandatory"
+srtp_secure_signaling = 1
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(parsed.sip.srtp_mode, SrtpMode::Mandatory);
+        assert_eq!(parsed.sip.srtp_secure_signaling, 1);
+    }
+
+    #[test]
+    fn parses_srtp_optional() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+account_uri = "sip:bridge@pbx.example.com"
+srtp_mode = "optional"
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(parsed.sip.srtp_mode, SrtpMode::Optional);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_srtp_secure_signaling() {
+        let parsed: Config = toml::from_str(
+            r#"
+[sip]
+account_uri = "sip:bridge@pbx.example.com"
+srtp_secure_signaling = 5
+
+[mumble]
+default_host = "mumble.example.com"
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(parsed.validate().is_err());
     }
 }
