@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.pocket-tts
-    image: mumble-sip/pocket-tts:latest
+    image: swarfield/pocket-tts:latest
     restart: unless-stopped
     ports:
       - "8000:8000"
