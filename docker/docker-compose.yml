@@ -32,8 +32,7 @@ services:
     depends_on:
       pocket-tts:
         condition: service_healthy
-    ports:
-      - "5061:5060/udp"
+    network_mode: host
     volumes:
       - ../config.toml:/config/config.toml:ro
       - mumble_sip_data:/data
